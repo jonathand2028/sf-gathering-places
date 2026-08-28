@@ -2,6 +2,7 @@ import os, sys, time, traceback
 import requests
 import streamlit as st
 import clickhouse_connect, certifi, psycopg2
+from contextlib import contextmanager
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,28 +55,56 @@ def ch():
     )
 
 
+@contextmanager
+def pg_conn():
+    conn = psycopg2.connect(secret("DATABASE_URL"), connect_timeout=10)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def pg_query(sql, params=None):
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as c:
+                c.execute(sql, params or ())
+                return c.fetchall() if c.description else []
+    except Exception as e:
+        record_error(sql, e)
+        raise
+
+
+def pg_exec(sql, params=None):
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as c:
+                c.execute(sql, params or ())
+    except Exception as e:
+        record_error(sql, e)
+        raise
+
+
 @st.cache_resource
-def pg():
-    conn = psycopg2.connect(secret("DATABASE_URL"))
-    conn.autocommit = True
-    with conn.cursor() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS saved_places (
-                id SERIAL PRIMARY KEY,
-                place_name TEXT,
-                address TEXT,
-                neighborhood TEXT,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS dismissed_places (
-                id SERIAL PRIMARY KEY,
-                place_name TEXT,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-    return conn
+def ensure_tables():
+    pg_exec("""
+        CREATE TABLE IF NOT EXISTS saved_places (
+            id SERIAL PRIMARY KEY,
+            place_name TEXT,
+            address TEXT,
+            neighborhood TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+    """)
+    pg_exec("""
+        CREATE TABLE IF NOT EXISTS dismissed_places (
+            id SERIAL PRIMARY KEY,
+            place_name TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+    """)
+    return True
 
 
 def naics_filter_sql():
@@ -137,25 +166,18 @@ def zip_to_neighborhood(zip_code):
 
 
 def fetch_dismissed_names():
-    sql = "SELECT place_name FROM dismissed_places"
     try:
-        with pg().cursor() as c:
-            c.execute(sql)
-            return {row[0] for row in c.fetchall()}
-    except Exception as e:
-        record_error(sql, e)
-        raise
+        rows = pg_query("SELECT place_name FROM dismissed_places")
+    except Exception:
+        return set()
+    return {row[0] for row in rows}
 
 
 def fetch_saved_places():
-    sql = "SELECT id, place_name, address, neighborhood FROM saved_places ORDER BY created_at DESC"
     try:
-        with pg().cursor() as c:
-            c.execute(sql)
-            return c.fetchall()
-    except Exception as e:
-        record_error(sql, e)
-        raise
+        return pg_query("SELECT id, place_name, address, neighborhood FROM saved_places ORDER BY created_at DESC")
+    except Exception:
+        return []
 
 
 def category_label(naics):
@@ -213,21 +235,18 @@ def render_neighborhood(neighborhood):
 
         col1, col2 = st.columns(2)
         if col1.button("Save this", type="primary", key="save_this"):
-            sql = "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)"
             try:
-                with pg().cursor() as c:
-                    c.execute(sql, (hero_name, hero_addr, neighborhood))
-            except Exception as e:
-                record_error(sql, e)
-                raise
+                pg_exec(
+                    "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)",
+                    (hero_name, hero_addr, neighborhood),
+                )
+            except Exception:
+                st.warning("Couldn't save that just now. Please try again.")
         if col2.button("Not for me", key="not_for_me"):
-            sql = "INSERT INTO dismissed_places (place_name) VALUES (%s)"
             try:
-                with pg().cursor() as c:
-                    c.execute(sql, (hero_name,))
-            except Exception as e:
-                record_error(sql, e)
-                raise
+                pg_exec("INSERT INTO dismissed_places (place_name) VALUES (%s)", (hero_name,))
+            except Exception:
+                st.warning("Couldn't update that just now. Please try again.")
             st.rerun()
 
     with st.container(border=True, key="invite_card"):
@@ -273,15 +292,17 @@ def render_saved_places():
             col1, col2 = st.columns([5, 1])
             col1.markdown(f"**{place_name}** — {address} ({neighborhood})")
             if col2.button("Remove", key=f"remove_{saved_id}"):
-                sql = "DELETE FROM saved_places WHERE id = %s"
                 try:
-                    with pg().cursor() as c:
-                        c.execute(sql, (saved_id,))
-                except Exception as e:
-                    record_error(sql, e)
-                    raise
+                    pg_exec("DELETE FROM saved_places WHERE id = %s", (saved_id,))
+                except Exception:
+                    st.warning("Couldn't remove that just now. Please try again.")
                 st.rerun()
 
+
+try:
+    ensure_tables()
+except Exception:
+    pass
 
 st.markdown("""
 <style>
@@ -516,12 +537,3 @@ except Exception as e:
     if st.session_state.get("last_error") is None:
         record_error("total_business_count (no SQL captured)", e)
     st.markdown("<div class='footer-note'>Couldn't reach the database just now.</div>", unsafe_allow_html=True)
-
-if st.session_state.get("last_error"):
-    with st.expander("Debug info"):
-        err = st.session_state.last_error
-        st.write(f"**Error:** {err['error']}")
-        st.write("**Query/context:**")
-        st.code(err["context"], language="sql")
-        st.write("**Traceback:**")
-        st.code(err["traceback"], language=None)
