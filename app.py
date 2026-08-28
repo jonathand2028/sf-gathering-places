@@ -1,4 +1,4 @@
-import os, time
+import os, sys, time, traceback
 import requests
 import streamlit as st
 import clickhouse_connect, certifi, psycopg2
@@ -8,18 +8,33 @@ load_dotenv()
 st.set_page_config(page_title="SF Gathering Places", page_icon="🫂", layout="wide")
 
 GATHERING_NAICS_PREFIXES = ("7225", "7224", "7139", "4512", "4592")
-NEIGHBORHOOD_CHIPS = [
-    ("Mission", "Mission"),
-    ("Chinatown", "Chinatown"),
-    ("Japantown", "Japantown"),
-    ("SoMa", "South of Market"),
-    ("Sunset", "Sunset/Parkside"),
-    ("Bayview", "Bayview Hunters Point"),
-    ("Marina", "Marina"),
-    ("Castro", "Castro/Upper Market"),
+
+CHIPS = {
+    "Mission": "Mission", "Chinatown": "Chinatown", "Japantown": "Japantown",
+    "SoMa": "South of Market", "Sunset": "Sunset/Parkside",
+    "Bayview": "Bayview Hunters Point", "Marina": "Marina",
+    "Castro": "Castro/Upper Market",
+}
+CHIP_LABELS = list(CHIPS.keys())
+HOOD_BY_LABEL = CHIPS
+
+ALL_HOODS = [
+    "Bayview Hunters Point", "Bernal Heights", "Castro/Upper Market", "Chinatown",
+    "Excelsior", "Financial District/South Beach", "Glen Park", "Golden Gate Park",
+    "Haight Ashbury", "Hayes Valley", "Inner Richmond", "Inner Sunset", "Japantown",
+    "Lakeshore", "Lincoln Park", "Lone Mountain/USF", "Marina", "McLaren Park",
+    "Mission", "Mission Bay", "Nob Hill", "Noe Valley", "North Beach",
+    "Oceanview/Merced/Ingleside", "Outer Mission", "Outer Richmond", "Pacific Heights",
+    "Portola", "Potrero Hill", "Presidio", "Presidio Heights", "Russian Hill",
+    "Seacliff", "South of Market", "Sunset/Parkside", "Tenderloin", "Treasure Island",
+    "Twin Peaks", "Visitacion Valley", "West of Twin Peaks", "Western Addition",
 ]
-CHIP_LABELS = [label for label, _ in NEIGHBORHOOD_CHIPS]
-HOOD_BY_LABEL = dict(NEIGHBORHOOD_CHIPS)
+
+
+def record_error(context, e):
+    tb = traceback.format_exc()
+    st.session_state.last_error = {"context": context, "error": f"{type(e).__name__}: {e}", "traceback": tb}
+    print(f"[ERROR] {context}\n{type(e).__name__}: {e}\n{tb}", file=sys.stderr)
 
 
 def secret(key):
@@ -69,8 +84,7 @@ def naics_filter_sql():
 
 @st.cache_data(ttl=300)
 def open_places(neighborhood):
-    t0 = time.time()
-    r = ch().query(f"""
+    sql = f"""
         SELECT uniqueid, dba_name, full_business_address,
                self_reported_naics_code, location_start_date
         FROM sf_business
@@ -78,59 +92,70 @@ def open_places(neighborhood):
           AND location_end_date = ''
           AND ({naics_filter_sql()})
         ORDER BY dba_name
-    """, parameters={"nb": neighborhood})
+    """
+    t0 = time.time()
+    try:
+        r = ch().query(sql, parameters={"nb": neighborhood})
+    except Exception as e:
+        record_error(sql, e)
+        raise
     ms = int((time.time() - t0) * 1000)
     return r.result_rows, ms
 
 
 @st.cache_data(ttl=300)
 def total_business_count():
+    sql = "SELECT count() FROM sf_business"
     t0 = time.time()
-    r = ch().query("SELECT count() FROM sf_business")
+    try:
+        r = ch().query(sql)
+    except Exception as e:
+        record_error(sql, e)
+        raise
     ms = int((time.time() - t0) * 1000)
     return r.result_rows[0][0], ms
 
 
 @st.cache_data(ttl=300)
-def dropdown_neighborhoods():
-    t0 = time.time()
-    r = ch().query("""
-        SELECT neighborhoods_analysis_boundaries AS hood, countIf(location_end_date = '') AS open_n
-        FROM sf_business
-        WHERE hood != '' AND hood != 'Multiple'
-        GROUP BY hood
-        HAVING open_n >= 50
-        ORDER BY hood
-    """)
-    ms = int((time.time() - t0) * 1000)
-    return [row[0] for row in r.result_rows], ms
-
-
-@st.cache_data(ttl=300)
 def zip_to_neighborhood(zip_code):
-    t0 = time.time()
-    r = ch().query("""
+    sql = """
         SELECT neighborhoods_analysis_boundaries AS hood, count() AS n
         FROM sf_business
         WHERE business_zip = {zip:String} AND hood != '' AND hood != 'Multiple'
         GROUP BY hood
         ORDER BY n DESC
         LIMIT 1
-    """, parameters={"zip": zip_code})
+    """
+    t0 = time.time()
+    try:
+        r = ch().query(sql, parameters={"zip": zip_code})
+    except Exception as e:
+        record_error(sql, e)
+        raise
     ms = int((time.time() - t0) * 1000)
     return (r.result_rows[0][0] if r.result_rows else None), ms
 
 
 def fetch_dismissed_names():
-    with pg().cursor() as c:
-        c.execute("SELECT place_name FROM dismissed_places")
-        return {row[0] for row in c.fetchall()}
+    sql = "SELECT place_name FROM dismissed_places"
+    try:
+        with pg().cursor() as c:
+            c.execute(sql)
+            return {row[0] for row in c.fetchall()}
+    except Exception as e:
+        record_error(sql, e)
+        raise
 
 
 def fetch_saved_places():
-    with pg().cursor() as c:
-        c.execute("SELECT id, place_name, address, neighborhood FROM saved_places ORDER BY created_at DESC")
-        return c.fetchall()
+    sql = "SELECT id, place_name, address, neighborhood FROM saved_places ORDER BY created_at DESC"
+    try:
+        with pg().cursor() as c:
+            c.execute(sql)
+            return c.fetchall()
+    except Exception as e:
+        record_error(sql, e)
+        raise
 
 
 def category_label(naics):
@@ -173,7 +198,7 @@ def render_neighborhood(neighborhood):
     candidates = [p for p in places_rows if p[1] not in dismissed and not is_junk_name(p[1], p[2])]
 
     if not candidates:
-        empty_state("No open places to gather here yet. Try another neighborhood.")
+        empty_state("No good matches here yet, try another neighborhood.")
         return
 
     hero_id, hero_name, hero_addr, hero_naics, hero_start = candidates[0]
@@ -188,14 +213,21 @@ def render_neighborhood(neighborhood):
 
         col1, col2 = st.columns(2)
         if col1.button("Save this", type="primary", key="save_this"):
-            with pg().cursor() as c:
-                c.execute(
-                    "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)",
-                    (hero_name, hero_addr, neighborhood),
-                )
+            sql = "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)"
+            try:
+                with pg().cursor() as c:
+                    c.execute(sql, (hero_name, hero_addr, neighborhood))
+            except Exception as e:
+                record_error(sql, e)
+                raise
         if col2.button("Not for me", key="not_for_me"):
-            with pg().cursor() as c:
-                c.execute("INSERT INTO dismissed_places (place_name) VALUES (%s)", (hero_name,))
+            sql = "INSERT INTO dismissed_places (place_name) VALUES (%s)"
+            try:
+                with pg().cursor() as c:
+                    c.execute(sql, (hero_name,))
+            except Exception as e:
+                record_error(sql, e)
+                raise
             st.rerun()
 
     with st.container(border=True, key="invite_card"):
@@ -241,8 +273,13 @@ def render_saved_places():
             col1, col2 = st.columns([5, 1])
             col1.markdown(f"**{place_name}** — {address} ({neighborhood})")
             if col2.button("Remove", key=f"remove_{saved_id}"):
-                with pg().cursor() as c:
-                    c.execute("DELETE FROM saved_places WHERE id = %s", (saved_id,))
+                sql = "DELETE FROM saved_places WHERE id = %s"
+                try:
+                    with pg().cursor() as c:
+                        c.execute(sql, (saved_id,))
+                except Exception as e:
+                    record_error(sql, e)
+                    raise
                 st.rerun()
 
 
@@ -442,12 +479,11 @@ st.pills(
     label_visibility="collapsed",
 )
 
-dropdown_options, _dropdown_ms = dropdown_neighborhoods()
 st.selectbox(
-    "Or pick another neighborhood.",
-    options=dropdown_options,
+    "Or pick another neighborhood",
+    options=sorted(ALL_HOODS),
     index=None,
-    placeholder="Or pick another neighborhood.",
+    placeholder="Or pick another neighborhood",
     key="neighborhood_dropdown",
     label_visibility="collapsed",
 )
@@ -461,14 +497,31 @@ if not neighborhood:
     empty_state("Pick a neighborhood above to get started.")
     st.stop()
 
+st.session_state.last_error = None
 try:
     render_neighborhood(neighborhood)
     render_saved_places()
-except Exception:
+except Exception as e:
+    if st.session_state.get("last_error") is None:
+        record_error("render (no SQL captured)", e)
     st.error("We're having trouble reaching our data right now. Please try again in a moment.")
 
-total_count, total_ms = total_business_count()
-st.markdown(
-    f"<div class='footer-note'>Chosen from {total_count:,} San Francisco business records in {total_ms} ms.</div>",
-    unsafe_allow_html=True,
-)
+try:
+    total_count, total_ms = total_business_count()
+    st.markdown(
+        f"<div class='footer-note'>Chosen from {total_count:,} San Francisco business records in {total_ms} ms.</div>",
+        unsafe_allow_html=True,
+    )
+except Exception as e:
+    if st.session_state.get("last_error") is None:
+        record_error("total_business_count (no SQL captured)", e)
+    st.markdown("<div class='footer-note'>Couldn't reach the database just now.</div>", unsafe_allow_html=True)
+
+if st.session_state.get("last_error"):
+    with st.expander("Debug info"):
+        err = st.session_state.last_error
+        st.write(f"**Error:** {err['error']}")
+        st.write("**Query/context:**")
+        st.code(err["context"], language="sql")
+        st.write("**Traceback:**")
+        st.code(err["traceback"], language=None)
