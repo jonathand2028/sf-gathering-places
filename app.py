@@ -91,6 +91,36 @@ def total_business_count():
     return r.result_rows[0][0], ms
 
 
+@st.cache_data(ttl=300)
+def dropdown_neighborhoods():
+    t0 = time.time()
+    r = ch().query("""
+        SELECT neighborhoods_analysis_boundaries AS hood, countIf(location_end_date = '') AS open_n
+        FROM sf_business
+        WHERE hood != '' AND hood != 'Multiple'
+        GROUP BY hood
+        HAVING open_n >= 50
+        ORDER BY hood
+    """)
+    ms = int((time.time() - t0) * 1000)
+    return [row[0] for row in r.result_rows], ms
+
+
+@st.cache_data(ttl=300)
+def zip_to_neighborhood(zip_code):
+    t0 = time.time()
+    r = ch().query("""
+        SELECT neighborhoods_analysis_boundaries AS hood, count() AS n
+        FROM sf_business
+        WHERE business_zip = {zip:String} AND hood != '' AND hood != 'Multiple'
+        GROUP BY hood
+        ORDER BY n DESC
+        LIMIT 1
+    """, parameters={"zip": zip_code})
+    ms = int((time.time() - t0) * 1000)
+    return (r.result_rows[0][0] if r.result_rows else None), ms
+
+
 def fetch_dismissed_names():
     with pg().cursor() as c:
         c.execute("SELECT place_name FROM dismissed_places")
@@ -348,16 +378,69 @@ st.markdown("<div class='page-subtitle'>Find one place near you, and someone to 
 
 if "neighborhood" not in st.session_state:
     st.session_state.neighborhood = None
+if "prev_pills" not in st.session_state:
+    st.session_state.prev_pills = None
+if "prev_dropdown" not in st.session_state:
+    st.session_state.prev_dropdown = None
+if "prev_zip" not in st.session_state:
+    st.session_state.prev_zip = ""
 
-selected_chip_label = st.pills(
+cur_pills = st.session_state.get("neighborhood_pills")
+cur_dropdown = st.session_state.get("neighborhood_dropdown")
+cur_zip = st.session_state.get("zip_input", "")
+
+zip_warning = None
+
+if cur_pills != st.session_state.prev_pills and cur_pills is not None:
+    st.session_state.neighborhood = HOOD_BY_LABEL[cur_pills]
+    st.session_state.neighborhood_dropdown = None
+    st.session_state.zip_input = ""
+elif cur_dropdown != st.session_state.prev_dropdown and cur_dropdown is not None:
+    st.session_state.neighborhood = cur_dropdown
+    st.session_state.neighborhood_pills = None
+    st.session_state.zip_input = ""
+elif cur_zip != st.session_state.prev_zip and cur_zip:
+    cleaned = cur_zip.strip()
+    if cleaned.isdigit() and len(cleaned) == 5:
+        zip_int = int(cleaned)
+        if not (94102 <= zip_int <= 94134 or zip_int == 94158):
+            zip_warning = "That's not a San Francisco zip code — this only covers SF for now."
+        else:
+            match, _zip_ms = zip_to_neighborhood(cleaned)
+            if match:
+                st.session_state.neighborhood = match
+                st.session_state.neighborhood_pills = None
+                st.session_state.neighborhood_dropdown = None
+            else:
+                zip_warning = "We don't have data for that zip code yet."
+    else:
+        zip_warning = "Enter a 5-digit San Francisco zip code."
+
+st.session_state.prev_pills = cur_pills
+st.session_state.prev_dropdown = cur_dropdown
+st.session_state.prev_zip = cur_zip
+
+st.pills(
     "Pick a neighborhood",
     options=CHIP_LABELS,
     selection_mode="single",
     key="neighborhood_pills",
     label_visibility="collapsed",
 )
-if selected_chip_label:
-    st.session_state.neighborhood = HOOD_BY_LABEL[selected_chip_label]
+
+dropdown_options, _dropdown_ms = dropdown_neighborhoods()
+st.selectbox(
+    "Or pick another neighborhood.",
+    options=dropdown_options,
+    index=None,
+    placeholder="Or pick another neighborhood.",
+    key="neighborhood_dropdown",
+    label_visibility="collapsed",
+)
+
+st.text_input("Or enter a zip code", placeholder="94110", key="zip_input", label_visibility="collapsed")
+if zip_warning:
+    st.warning(zip_warning)
 
 neighborhood = st.session_state.neighborhood
 if not neighborhood:
