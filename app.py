@@ -446,6 +446,16 @@ def fetch_saved_places():
         return []
 
 
+def fetch_dismissed_places():
+    try:
+        return pg_query(
+            "SELECT id, place_name FROM dismissed_places WHERE visitor_id = %s ORDER BY created_at DESC",
+            (st.session_state.visitor_id,),
+        )
+    except Exception:
+        return []
+
+
 def category_label(naics):
     if naics.startswith("7224"):
         return "Bar"
@@ -627,6 +637,12 @@ def render_body(neighborhood=None, anchor=None):
             f"<div class='ch-badge'>⚡ {total_count:,} records scanned in {fetch_ms}ms via ClickHouse Cloud</div>",
             unsafe_allow_html=True,
         )
+        saved_rows = fetch_saved_places()
+        dismissed_rows = fetch_dismissed_places()
+        st.markdown(
+            f"<div class='ch-badge'>🐘 Postgres Session: {len(saved_rows)} Saved • {len(dismissed_rows)} Avoided</div>",
+            unsafe_allow_html=True,
+        )
 
     one_of_text = (
         f"One of {len(candidates):,} places near {location_label}."
@@ -710,10 +726,9 @@ def render_body(neighborhood=None, anchor=None):
             else:
                 render_generated_text(draft)
 
-    saved = fetch_saved_places()
-    if saved:
+    if saved_rows:
         section_label("Your list")
-        for saved_id, place_name, address, saved_hood in saved:
+        for saved_id, place_name, address, saved_hood in saved_rows:
             with st.container(border=True, key=f"saved_row_{saved_id}"):
                 col1, col2 = st.columns([5, 1])
                 col1.markdown(f"**{place_name}** — {address} ({saved_hood})")
@@ -726,6 +741,27 @@ def render_body(neighborhood=None, anchor=None):
                     except Exception:
                         st.warning("Couldn't remove that just now. Please try again.")
                     st.rerun()
+
+    with st.expander(f"Avoided Places ({len(dismissed_rows)})", expanded=False):
+        if dismissed_rows:
+            for dismissed_id, dismissed_name in dismissed_rows:
+                col1, col2 = st.columns([5, 1])
+                col1.markdown(f"**{dismissed_name}**")
+                if col2.button("Restore", key=f"restore_{dismissed_id}"):
+                    try:
+                        pg_exec(
+                            "DELETE FROM dismissed_places WHERE id = %s AND visitor_id = %s",
+                            (dismissed_id, st.session_state.visitor_id),
+                        )
+                    except Exception:
+                        st.warning("Couldn't restore that just now. Please try again.")
+                    st.session_state.solo_draft = ""
+                    st.session_state.solo_is_fallback = False
+                    st.session_state.invite_drafts = []
+                    st.session_state.invite_is_fallback = False
+                    st.rerun()
+        else:
+            st.markdown("<div class='muted-text'>Nothing avoided yet.</div>", unsafe_allow_html=True)
 
     total_count, _total_ms = total_business_count()
     funnel_middle = f"{len(candidates):,} nearest to {location_label}" if anchor else f"{len(candidates):,} still open in {location_label}"
