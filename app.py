@@ -208,25 +208,93 @@ def total_business_count():
     return r.result_rows[0][0], ms
 
 
-@st.cache_data(ttl=600)
-def zip_to_neighborhood(zip_code):
+@st.cache_data(ttl=86400, show_spinner=False)
+def geocode(query):
+    """Returns (lat, lon, display_name) or None."""
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "us"},
+            headers={"User-Agent": "SFGatheringPlaces/1.0 (hackathon project)"},
+            timeout=6,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
+    except Exception:
+        return None
+
+
+def short_display(display_name):
+    parts = [p.strip() for p in display_name.split(",")]
+    return ", ".join(parts[:4]) if len(parts) > 4 else display_name
+
+
+def match_neighborhood_name(text):
+    q = text.strip().lower()
+    for h in ALL_HOODS:
+        if h.lower() == q:
+            return h
+    for h in ALL_HOODS:
+        if h.lower().startswith(q):
+            return h
+    for h in ALL_HOODS:
+        if q in h.lower():
+            return h
+    return None
+
+
+def format_distance(dist_m):
+    miles = dist_m / 1609.34
+    if miles <= 2:
+        walk_min = round((miles / 3) * 60)
+        return f"{miles:.1f} miles away · {walk_min} min walk"
+    return f"{miles:.1f} miles away"
+
+
+@st.cache_data(ttl=3600)
+def neighborhood_anchor_coords():
     sql = """
-        SELECT neighborhoods_analysis_boundaries AS hood, count() AS n
+        SELECT neighborhoods_analysis_boundaries AS hood,
+               medianExact(readWKTPoint(location).1) AS lon,
+               medianExact(readWKTPoint(location).2) AS lat
         FROM sf_business
-        WHERE business_zip = {zip:String} AND hood != '' AND hood != 'Multiple'
-          AND city = 'San Francisco'
+        WHERE location != '' AND startsWith(location, 'POINT')
+          AND hood != '' AND hood != 'Multiple'
         GROUP BY hood
-        ORDER BY n DESC
-        LIMIT 1
+    """
+    try:
+        r = ch().query(sql)
+    except Exception as e:
+        record_error(sql, e)
+        raise
+    return {row[0]: (row[1], row[2]) for row in r.result_rows}
+
+
+@st.cache_data(ttl=600)
+def places_near_anchor(anchor_lat, anchor_lon, limit=200):
+    sql = f"""
+        SELECT uniqueid, dba_name, full_business_address, self_reported_naics_code, location_start_date,
+               geoDistance(readWKTPoint(location).1, readWKTPoint(location).2, {{lon:Float64}}, {{lat:Float64}}) AS dist_m,
+               neighborhoods_analysis_boundaries AS hood
+        FROM sf_business
+        WHERE location_end_date = ''
+          AND city = 'San Francisco'
+          AND location != '' AND startsWith(location, 'POINT')
+          AND {place_filter_sql()}
+        ORDER BY dist_m ASC
+        LIMIT {{lim:UInt32}}
     """
     t0 = time.time()
     try:
-        r = ch().query(sql, parameters={"zip": zip_code})
+        r = ch().query(sql, parameters={"lat": anchor_lat, "lon": anchor_lon, "lim": limit})
     except Exception as e:
         record_error(sql, e)
         raise
     ms = int((time.time() - t0) * 1000)
-    return (r.result_rows[0][0] if r.result_rows else None), ms
+    return r.result_rows, ms
 
 
 @st.cache_data(ttl=600)
@@ -315,10 +383,28 @@ def empty_state(text):
 FILTER_OPTIONS = ["Show up alone", "Free or low cost", "Anywhere"]
 
 
-def render_neighborhood(neighborhood):
-    places_rows, places_ms = open_places(neighborhood)
+OUT_OF_SF_MILES = 1.0
+
+
+def render_body(neighborhood=None, anchor=None):
+    if anchor:
+        st.markdown(f"<div class='muted-text' style='margin-bottom:12px;'>Found: {anchor['label']}.</div>", unsafe_allow_html=True)
+        raw_rows, fetch_ms = places_near_anchor(anchor["lat"], anchor["lon"])
+        rows = [
+            {"id": r[0], "name": r[1], "addr": r[2], "naics": r[3], "start": r[4], "dist_m": r[5], "hood": r[6]}
+            for r in raw_rows
+        ]
+        location_label = anchor["label"]
+    else:
+        raw_rows, fetch_ms = open_places(neighborhood)
+        rows = [
+            {"id": r[0], "name": r[1], "addr": r[2], "naics": r[3], "start": r[4], "dist_m": None, "hood": neighborhood}
+            for r in raw_rows
+        ]
+        location_label = neighborhood
+
     dismissed = fetch_dismissed_names()
-    candidates = [p for p in places_rows if p[1] not in dismissed and not is_junk_name(p[1], p[2])]
+    candidates = [p for p in rows if p["name"] not in dismissed and not is_junk_name(p["name"], p["addr"])]
 
     category_filter = st.pills(
         "Filter",
@@ -330,9 +416,9 @@ def render_neighborhood(neighborhood):
     ) or "Show up alone"
 
     if category_filter == "Show up alone":
-        candidates = [p for p in candidates if is_alone_friendly(p[1])]
+        candidates = [p for p in candidates if is_alone_friendly(p["name"])]
     elif category_filter == "Free or low cost":
-        candidates = [p for p in candidates if is_free_or_low_cost(p[1])]
+        candidates = [p for p in candidates if is_free_or_low_cost(p["name"])]
 
     if not candidates:
         if category_filter == "Show up alone":
@@ -343,13 +429,26 @@ def render_neighborhood(neighborhood):
             empty_state("No good matches here yet, try another neighborhood.")
         return None
 
-    hero_id, hero_name, hero_addr, hero_naics, hero_start = candidates[0]
-    record_shown(hero_name, neighborhood)
+    hero = candidates[0]
+    hero_id, hero_name, hero_addr, hero_naics, hero_start = (
+        hero["id"], hero["name"], hero["addr"], hero["naics"], hero["start"],
+    )
+    hero_hood = hero["hood"] or location_label
+    record_shown(hero_name, hero_hood)
+
+    if anchor and hero["dist_m"] is not None and hero["dist_m"] / 1609.34 > OUT_OF_SF_MILES:
+        st.markdown(
+            f"<div class='muted-text' style='margin-bottom:12px;'>You're about "
+            f"{hero['dist_m'] / 1609.34:.1f} miles from the nearest place we cover — other cities coming soon.</div>",
+            unsafe_allow_html=True,
+        )
 
     with st.container(border=True, key="hero_card"):
         st.markdown(f"<span class='type-tag'>{type_tag(hero_name, hero_naics)}</span>", unsafe_allow_html=True)
         st.markdown(f"<div class='hero-name'>{hero_name}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='muted-text'>{hero_addr}</div>", unsafe_allow_html=True)
+        if hero["dist_m"] is not None:
+            st.markdown(f"<div class='muted-text'>{format_distance(hero['dist_m'])}</div>", unsafe_allow_html=True)
         if hero_start:
             st.markdown(f"<div class='muted-text'>open since {hero_start[:4]}</div>", unsafe_allow_html=True)
 
@@ -358,7 +457,7 @@ def render_neighborhood(neighborhood):
             try:
                 pg_exec(
                     "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)",
-                    (hero_name, hero_addr, neighborhood),
+                    (hero_name, hero_addr, hero_hood),
                 )
                 st.toast("Saved")
             except Exception:
@@ -370,10 +469,12 @@ def render_neighborhood(neighborhood):
                 st.warning("Couldn't update that just now. Please try again.")
             st.rerun()
 
-    st.markdown(
-        f"<div class='muted-text' style='margin:-4px 0 4px;'>One of {len(candidates):,} places still open in {neighborhood}.</div>",
-        unsafe_allow_html=True,
+    one_of_text = (
+        f"One of {len(candidates):,} places near {location_label}."
+        if anchor else
+        f"One of {len(candidates):,} places still open in {location_label}."
     )
+    st.markdown(f"<div class='muted-text' style='margin:-4px 0 4px;'>{one_of_text}</div>", unsafe_allow_html=True)
 
     kind = type_tag(hero_name, hero_naics).lower()
     open_since_text = f"open since {hero_start[:4]}" if hero_start else None
@@ -391,7 +492,7 @@ def render_neighborhood(neighborhood):
             st.session_state.writing_solo = True
             with st.spinner("Thinking it through…"):
                 prompt = (
-                    f"Someone is thinking about going alone to {hero_name}, a {kind} in {neighborhood}, "
+                    f"Someone is thinking about going alone to {hero_name}, a {kind} in {hero_hood}, "
                     f"San Francisco" + (f", {open_since_text}" if open_since_text else "") + ". "
                     f"Write 3 to 4 short, practical sentences about what it's actually like to show up there by "
                     f"yourself: a good time to go, anything to bring, what to say to whoever's at the front desk "
@@ -416,7 +517,7 @@ def render_neighborhood(neighborhood):
             with st.spinner("Writing your invite…"):
                 prompt = (
                     f"Write two different short text messages inviting a friend to {hero_name}, a {kind} "
-                    f"in {neighborhood}, San Francisco" + (f" ({open_since_text})" if open_since_text else "") + ". "
+                    f"in {hero_hood}, San Francisco" + (f" ({open_since_text})" if open_since_text else "") + ". "
                     f"Each must sound like an actual text a real person would send a friend, not an invitation "
                     f"or a flyer. Rules: lowercase and casual, 2-3 sentences max, no exclamation marks, no "
                     f"\"hey there\" or similar greetings, no marketing language, include one concrete suggestion "
@@ -450,9 +551,10 @@ def render_neighborhood(neighborhood):
                     st.rerun()
 
     total_count, _total_ms = total_business_count()
+    funnel_middle = f"{len(candidates):,} nearest to {location_label}" if anchor else f"{len(candidates):,} still open in {location_label}"
     st.markdown(
         f"<div class='footer-note'>Searched {total_count:,} records in San Francisco's business registry "
-        f"→ {len(candidates):,} still open in {neighborhood} → 1 picked, in {places_ms} ms.</div>",
+        f"→ {funnel_middle} → 1 picked, in {fetch_ms} ms.</div>",
         unsafe_allow_html=True,
     )
 
@@ -736,47 +838,72 @@ st.markdown("<div class='page-subtitle'>Places you can walk into alone, where yo
 
 if "neighborhood" not in st.session_state:
     st.session_state.neighborhood = None
+if "anchor" not in st.session_state:
+    st.session_state.anchor = None
 if "prev_pills" not in st.session_state:
     st.session_state.prev_pills = None
 if "prev_dropdown" not in st.session_state:
     st.session_state.prev_dropdown = None
-if "prev_zip" not in st.session_state:
-    st.session_state.prev_zip = ""
+if "prev_search" not in st.session_state:
+    st.session_state.prev_search = ""
 
 cur_pills = st.session_state.get("neighborhood_pills")
 cur_dropdown = st.session_state.get("neighborhood_dropdown")
-cur_zip = st.session_state.get("zip_input", "")
+cur_search = st.session_state.get("search_box", "")
 
-zip_warning = None
+search_warning = None
 
 if cur_pills != st.session_state.prev_pills and cur_pills is not None:
     st.session_state.neighborhood = cur_pills
+    st.session_state.anchor = None
     st.session_state.neighborhood_dropdown = None
-    st.session_state.zip_input = ""
+    st.session_state.search_box = ""
 elif cur_dropdown != st.session_state.prev_dropdown and cur_dropdown is not None:
     st.session_state.neighborhood = cur_dropdown
+    st.session_state.anchor = None
     st.session_state.neighborhood_pills = None
-    st.session_state.zip_input = ""
-elif cur_zip != st.session_state.prev_zip and cur_zip:
-    cleaned = cur_zip.strip()
+    st.session_state.search_box = ""
+elif cur_search != st.session_state.prev_search and cur_search:
+    cleaned = cur_search.strip()
     if cleaned.isdigit() and len(cleaned) == 5:
-        zip_int = int(cleaned)
-        if not (94102 <= zip_int <= 94134 or zip_int == 94158):
-            zip_warning = "That's not a San Francisco zip code — this only covers SF for now."
+        result = geocode(f"{cleaned}, CA, USA")
+        if result:
+            lat, lon, display = result
+            st.session_state.anchor = {"lat": lat, "lon": lon, "label": short_display(display)}
+            st.session_state.neighborhood = None
+            st.session_state.neighborhood_pills = None
+            st.session_state.neighborhood_dropdown = None
         else:
-            match, _zip_ms = zip_to_neighborhood(cleaned)
-            if match:
-                st.session_state.neighborhood = match
+            search_warning = "We couldn't find that zip code. Try a different one or pick a neighborhood above."
+    else:
+        matched_hood = match_neighborhood_name(cleaned)
+        if matched_hood:
+            try:
+                coords = neighborhood_anchor_coords().get(matched_hood)
+            except Exception:
+                coords = None
+            if coords:
+                lon, lat = coords
+                st.session_state.anchor = {"lat": lat, "lon": lon, "label": matched_hood}
+                st.session_state.neighborhood = None
                 st.session_state.neighborhood_pills = None
                 st.session_state.neighborhood_dropdown = None
             else:
-                zip_warning = "We don't have data for that zip code yet."
-    else:
-        zip_warning = "Enter a 5-digit San Francisco zip code."
+                search_warning = "We're having trouble reaching our data right now. Please try again in a moment."
+        else:
+            result = geocode(cleaned)
+            if result:
+                lat, lon, display = result
+                st.session_state.anchor = {"lat": lat, "lon": lon, "label": short_display(display)}
+                st.session_state.neighborhood = None
+                st.session_state.neighborhood_pills = None
+                st.session_state.neighborhood_dropdown = None
+            else:
+                search_warning = "We couldn't find that address. Try a zip code or pick a neighborhood above."
 
 st.session_state.prev_pills = cur_pills
 st.session_state.prev_dropdown = cur_dropdown
-st.session_state.prev_zip = cur_zip
+st.session_state.prev_search = cur_search
 
 if chip_hoods:
     st.markdown("<div class='chip-caption'>The neighborhoods with the most places to gather</div>", unsafe_allow_html=True)
@@ -798,18 +925,22 @@ st.selectbox(
     label_visibility="collapsed",
 )
 
-st.text_input("Or enter a zip code", placeholder="94110", key="zip_input", label_visibility="collapsed")
-if zip_warning:
-    st.warning(zip_warning)
+st.text_input(
+    "Your address, neighborhood, or zip", placeholder="Your address, neighborhood, or zip",
+    key="search_box", label_visibility="collapsed",
+)
+if search_warning:
+    st.warning(search_warning)
 
 neighborhood = st.session_state.neighborhood
-if not neighborhood:
+anchor = st.session_state.anchor
+if not neighborhood and not anchor:
     empty_state("Pick a neighborhood above to get started.")
     st.stop()
 
 st.session_state.last_error = None
 try:
-    render_neighborhood(neighborhood)
+    render_body(neighborhood=neighborhood, anchor=anchor)
 except Exception as e:
     if st.session_state.get("last_error") is None:
         record_error("render (no SQL captured)", e)
