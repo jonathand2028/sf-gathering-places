@@ -306,7 +306,7 @@ except Exception:
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 #MainMenu, footer, header,
 [data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stToolbarActions"],
@@ -319,132 +319,159 @@ html, body, [class*="css"] {
 }
 
 .stApp {
-    background: linear-gradient(180deg, #0B0D11 0%, #14171E 100%);
+    background: #06080F;
+    background-image:
+        radial-gradient(1100px circle at 50% -15%, rgba(59,130,246,0.28), transparent 55%),
+        radial-gradient(800px circle at 15% 30%, rgba(37,99,235,0.12), transparent 60%);
     background-attachment: fixed;
 }
 
 .block-container {
-    max-width: 1080px;
+    max-width: 880px;
     margin: 0 auto;
-    padding-top: 2rem;
-    padding-left: 24px;
-    padding-right: 24px;
-    padding-bottom: 48px;
+    padding: 80px 24px;
 }
 
 [data-testid="stVerticalBlock"] { gap: 12px !important; }
 
-h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
+h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
 
-.eyebrow {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    font-weight: 600;
-    color: #FF6B4A;
-    margin-bottom: 8px;
+.hero-badge {
+    display: table;
+    margin: 0 auto 24px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 999px;
+    padding: 7px 18px;
+    font-size: 13px;
+    color: #94A3B8;
 }
 .page-title {
-    font-size: 44px;
+    font-size: 58px;
     font-weight: 800;
-    letter-spacing: -0.03em;
-    color: #F2F4F7;
-    margin-bottom: 4px;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+    color: #FFFFFF;
+    text-align: center;
+    margin-bottom: 0;
 }
 .page-subtitle {
-    font-size: 16px;
-    color: #8B95A5;
-    margin-bottom: 12px;
+    font-size: 18px;
+    color: #94A3B8;
+    max-width: 540px;
+    margin: 14px auto 36px;
+    text-align: center;
 }
 .section-label {
     font-size: 13px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     font-weight: 600;
-    color: #8B95A5;
+    color: #94A3B8;
     margin-bottom: 8px;
 }
 .muted-text {
     font-size: 16px;
-    color: #8B95A5;
+    color: #94A3B8;
 }
 .hero-name {
     font-size: 30px;
     font-weight: 700;
-    color: #F2F4F7;
+    color: #F1F5F9;
     line-height: 1.2;
     margin-bottom: 4px;
 }
 .footer-note {
     font-size: 13px;
-    color: #8B95A5;
+    color: #94A3B8;
     margin-top: 24px;
 }
 
 /* cards */
 .st-key-hero_card, .st-key-invite_card, [class*="st-key-saved_row_"] {
-    background: #171B22 !important;
-    border: 1px solid #242A33 !important;
-    border-radius: 14px !important;
-    padding: 32px !important;
+    background: rgba(255,255,255,0.035) !important;
+    border: 1px solid rgba(255,255,255,0.09) !important;
+    border-radius: 16px !important;
+    padding: 30px !important;
     margin-bottom: 20px !important;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px -16px rgba(0,0,0,0.8) !important;
-}
-.st-key-hero_card {
-    border-left: 2px solid #FF6B4A !important;
-    background:
-        radial-gradient(600px circle at 20% 0%, rgba(255,107,74,0.10), transparent 60%),
-        #171B22 !important;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 20px 60px -30px rgba(0,0,0,0.9) !important;
 }
 
 .empty-state {
     text-align: center;
-    color: #8B95A5;
+    color: #94A3B8;
     padding: 48px 24px;
-    border: 1px dashed #242A33;
-    border-radius: 14px;
-    background: #171B22;
+    border: 1px dashed rgba(255,255,255,0.09);
+    border-radius: 16px;
+    background: rgba(255,255,255,0.035);
 }
 
 /* pills (neighborhood chips) */
+.st-key-neighborhood_pills [data-testid="stButtonGroup"] {
+    display: flex !important;
+    justify-content: center !important;
+    flex-wrap: wrap !important;
+}
 .st-key-neighborhood_pills button {
-    border-radius: 8px !important;
-    padding: 8px 16px !important;
+    border-radius: 999px !important;
+    padding: 9px 18px !important;
     font-size: 14px !important;
     white-space: nowrap !important;
-    border: 1px solid #242A33 !important;
-    background-color: #171B22 !important;
-    color: #F2F4F7 !important;
+    width: auto !important;
+    border: 1px solid rgba(255,255,255,0.10) !important;
+    background-color: rgba(255,255,255,0.05) !important;
+    color: #CBD5E1 !important;
 }
 .st-key-neighborhood_pills button[aria-pressed="true"],
 .st-key-neighborhood_pills button[aria-checked="true"],
 .st-key-neighborhood_pills button[aria-selected="true"] {
-    background-color: #FF6B4A !important;
-    color: #0E1116 !important;
+    background-color: #3B82F6 !important;
+    color: #FFFFFF !important;
     border: none !important;
+    box-shadow: 0 0 24px rgba(59,130,246,0.45) !important;
 }
 
 /* buttons */
 .stButton>button {
-    border-radius: 8px;
+    border-radius: 10px;
 }
 .stButton>button[kind="primary"] {
-    background-color: #FF6B4A;
-    color: #0E1116;
-    border-radius: 8px;
-    padding: 10px 20px;
-    font-weight: 500;
+    background-color: #3B82F6;
+    color: #FFFFFF;
+    border-radius: 10px;
+    padding: 12px 26px;
+    font-weight: 600;
     border: none;
 }
+.stButton>button[kind="primary"]:hover {
+    background-color: #2563EB;
+    color: #FFFFFF;
+}
 .stButton>button[kind="secondary"] {
-    background-color: #171B22;
-    border: 1px solid #242A33;
-    color: #F2F4F7;
+    background-color: transparent;
+    border: 1px solid rgba(255,255,255,0.14);
+    color: #CBD5E1;
+}
+
+/* inputs and dropdown */
+[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+    background-color: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(255,255,255,0.10) !important;
+    border-radius: 10px !important;
+    color: #F1F5F9 !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<div class='eyebrow'>San Francisco</div>", unsafe_allow_html=True)
+try:
+    badge_count, _badge_ms = total_business_count()
+    badge_text = f"San Francisco · {badge_count:,} places"
+except Exception:
+    badge_text = "San Francisco"
+
+st.markdown(f"<div class='hero-badge'>{badge_text}</div>", unsafe_allow_html=True)
 st.markdown("<div class='page-title'>SF Gathering Places</div>", unsafe_allow_html=True)
 st.markdown("<div class='page-subtitle'>Find one place near you, and someone to go with.</div>", unsafe_allow_html=True)
 
