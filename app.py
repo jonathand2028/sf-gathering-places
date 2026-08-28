@@ -1,4 +1,4 @@
-import os, time
+import os, re, time
 import requests
 import streamlit as st
 import pandas as pd
@@ -6,9 +6,20 @@ import clickhouse_connect, certifi, psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
-st.set_page_config(page_title="SF Gathering Places", layout="centered")
+st.set_page_config(page_title="SF Gathering Places", page_icon="🫂", layout="wide")
 
 GATHERING_NAICS_PREFIXES = ("7225", "7224", "7139", "4512", "4592")
+NEIGHBORHOOD_CHIPS = [
+    ("Mission", "Mission"),
+    ("Chinatown", "Chinatown"),
+    ("Japantown", "Japantown"),
+    ("SoMa", "South of Market"),
+    ("Sunset", "Sunset/Parkside"),
+    ("Bayview", "Bayview Hunters Point"),
+    ("Marina", "Marina"),
+    ("Castro", "Castro/Upper Market"),
+]
+POINT_RE = re.compile(r"POINT \(([-\d.]+) ([-\d.]+)\)")
 
 
 def secret(key):
@@ -45,74 +56,207 @@ def pg():
     return conn
 
 
-def q(sql, params=None):
-    t0 = time.time()
-    r = ch().query(sql, parameters=params or {})
-    ms = int((time.time() - t0) * 1000)
-    return r.result_rows, r.column_names, ms
-
-
 def naics_filter_sql():
     return " OR ".join(f"startsWith(self_reported_naics_code, '{p}')" for p in GATHERING_NAICS_PREFIXES)
 
+
+@st.cache_data(ttl=300)
+def all_neighborhood_names():
+    t0 = time.time()
+    r = ch().query("""
+        SELECT DISTINCT neighborhoods_analysis_boundaries
+        FROM sf_business
+        WHERE neighborhoods_analysis_boundaries != '' AND neighborhoods_analysis_boundaries != 'Multiple'
+    """)
+    ms = int((time.time() - t0) * 1000)
+    return [row[0] for row in r.result_rows], ms
+
+
+@st.cache_data(ttl=300)
+def zip_to_neighborhood(zip_code):
+    t0 = time.time()
+    r = ch().query("""
+        SELECT neighborhoods_analysis_boundaries AS hood, count() AS n
+        FROM sf_business
+        WHERE business_zip = {zip:String} AND hood != '' AND hood != 'Multiple'
+        GROUP BY hood
+        ORDER BY n DESC
+        LIMIT 1
+    """, parameters={"zip": zip_code})
+    ms = int((time.time() - t0) * 1000)
+    return (r.result_rows[0][0] if r.result_rows else None), ms
+
+
+@st.cache_data(ttl=300)
+def neighborhood_summary(neighborhood):
+    t0 = time.time()
+    r = ch().query(f"""
+        SELECT
+            countIf(location_end_date = '' AND ({naics_filter_sql()})) AS open_now,
+            countIf(location_start_date != ''
+                    AND parseDateTimeBestEffortOrNull(location_start_date) >= toDate('2019-01-01')
+                    AND ({naics_filter_sql()})) AS opened_since_2019,
+            countIf(location_end_date != ''
+                    AND parseDateTimeBestEffortOrNull(location_end_date) >= toDate('2019-01-01')
+                    AND ({naics_filter_sql()})) AS closed_since_2019
+        FROM sf_business
+        WHERE neighborhoods_analysis_boundaries = {{nb:String}}
+    """, parameters={"nb": neighborhood})
+    ms = int((time.time() - t0) * 1000)
+    open_now, opened_since, closed_since = r.result_rows[0]
+    return {"open_now": open_now, "opened_since_2019": opened_since, "closed_since_2019": closed_since}, ms
+
+
+@st.cache_data(ttl=300)
+def citywide_gathering_counts():
+    t0 = time.time()
+    r = ch().query(f"""
+        SELECT neighborhoods_analysis_boundaries AS hood,
+               countIf(location_end_date = '' AND ({naics_filter_sql()})) AS n
+        FROM sf_business
+        WHERE hood != '' AND hood != 'Multiple'
+        GROUP BY hood
+        ORDER BY n DESC
+    """)
+    ms = int((time.time() - t0) * 1000)
+    return pd.DataFrame(r.result_rows, columns=["hood", "n"]).reset_index(drop=True), ms
+
+
+@st.cache_data(ttl=300)
+def closures_per_year(neighborhood):
+    t0 = time.time()
+    r = ch().query("""
+        SELECT toYear(parseDateTimeBestEffortOrNull(location_end_date)) AS yr, count() AS n
+        FROM sf_business
+        WHERE neighborhoods_analysis_boundaries = {nb:String}
+          AND location_end_date != ''
+          AND toYear(parseDateTimeBestEffortOrNull(location_end_date)) BETWEEN 2015 AND 2026
+        GROUP BY yr
+        ORDER BY yr
+    """, parameters={"nb": neighborhood})
+    ms = int((time.time() - t0) * 1000)
+    df = pd.DataFrame(r.result_rows, columns=["Year", "Businesses closed"]).set_index("Year")
+    return df.reindex(range(2015, 2027), fill_value=0), ms
+
+
+@st.cache_data(ttl=300)
+def open_places(neighborhood):
+    t0 = time.time()
+    r = ch().query(f"""
+        SELECT uniqueid, dba_name, full_business_address, location
+        FROM sf_business
+        WHERE neighborhoods_analysis_boundaries = {{nb:String}}
+          AND location_end_date = ''
+          AND ({naics_filter_sql()})
+        ORDER BY dba_name
+    """, parameters={"nb": neighborhood})
+    ms = int((time.time() - t0) * 1000)
+    return r.result_rows, ms
+
+
+def fuzzy_match_neighborhood(text, names):
+    q = text.strip().lower()
+    for n in names:
+        if n.lower() == q:
+            return n
+    for n in names:
+        if n.lower().startswith(q):
+            return n
+    for n in names:
+        if q in n.lower():
+            return n
+    return None
+
+
+def stat_card(label, value):
+    return f"""
+    <div style="background:white;border:1px solid #E3E7ED;border-radius:12px;
+                padding:20px;text-align:center;">
+      <div style="font-size:28px;font-weight:700;color:#101722;">{value}</div>
+      <div style="font-size:14px;color:#5A6472;margin-top:4px;">{label}</div>
+    </div>
+    """
+
+
+st.markdown("""
+<style>
+#MainMenu, header, footer {visibility: hidden;}
+.stDeployButton {display: none;}
+html, body, [class*="css"] { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+.stApp { background-color: #F7F8FA; }
+.block-container { max-width: 900px; margin: 0 auto; padding-top: 2rem; }
+h1, h2, h3, p, label, span, div { color: #101722; }
+.stButton>button {
+    border-radius: 999px;
+    padding: 0.4rem 1.2rem;
+    border: 1px solid #E3E7ED;
+    background-color: white;
+    color: #101722;
+}
+.stButton>button[kind="primary"] {
+    background-color: #2a78d6;
+    border-color: #2a78d6;
+    color: white;
+}
+</style>
+""", unsafe_allow_html=True)
 
 timings = []
 
 st.title("SF Gathering Places")
 st.write("Find a spot near you and invite a friend to meet up.")
 
-zip_code = st.text_input("Your zip code", placeholder="94115").strip()
+if "neighborhood" not in st.session_state:
+    st.session_state.neighborhood = None
+if "last_search" not in st.session_state:
+    st.session_state.last_search = ""
 
-if not zip_code:
-    st.info("Enter a San Francisco zip code above to get started.")
+st.write("**Pick a neighborhood**")
+chip_cols = st.columns(len(NEIGHBORHOOD_CHIPS))
+for col, (label, hood) in zip(chip_cols, NEIGHBORHOOD_CHIPS):
+    is_selected = st.session_state.neighborhood == hood
+    if col.button(label, key=f"chip_{hood}", type="primary" if is_selected else "secondary"):
+        st.session_state.neighborhood = hood
+
+search_text = st.text_input("Or type a zip code or neighborhood", placeholder="94110 or Mission")
+if search_text and search_text != st.session_state.last_search:
+    st.session_state.last_search = search_text
+    names, names_ms = all_neighborhood_names()
+    timings.append(("looking up neighborhoods", names_ms))
+    cleaned = search_text.strip()
+    if cleaned.isdigit() and len(cleaned) == 5:
+        match, zip_ms = zip_to_neighborhood(cleaned)
+        timings.append(("matching your zip code", zip_ms))
+    else:
+        match = fuzzy_match_neighborhood(cleaned, names)
+    if match:
+        st.session_state.neighborhood = match
+    else:
+        st.warning(f"We couldn't match \"{search_text}\" to a San Francisco neighborhood or zip code.")
+
+neighborhood = st.session_state.neighborhood
+if not neighborhood:
+    st.info("Pick a neighborhood above, or type a zip code or neighborhood name, to get started.")
     st.stop()
 
-if not (zip_code.isdigit() and len(zip_code) == 5):
-    st.warning("That doesn't look like a zip code. Try one like 94115.")
-    st.stop()
+st.header(f"You're looking at {neighborhood}.")
 
-hood_rows, _, hood_ms = q("""
-    SELECT neighborhoods_analysis_boundaries AS hood, count() AS n
-    FROM sf_business
-    WHERE business_zip = {zip:String} AND hood != '' AND hood != 'Multiple'
-    GROUP BY hood
-    ORDER BY n DESC
-    LIMIT 1
-""", {"zip": zip_code})
-timings.append(("looking up your area", hood_ms))
+summary, summary_ms = neighborhood_summary(neighborhood)
+timings.append(("counting places here", summary_ms))
+place_count = summary["open_now"]
 
-if not hood_rows:
-    st.warning("We couldn't find that zip code. Try one like 94115.")
-    st.stop()
-
-neighborhood = hood_rows[0][0]
-
-st.header(f"You're in {neighborhood}.")
-
-count_rows, _, count_ms = q(f"""
-    SELECT count() FROM sf_business
-    WHERE neighborhoods_analysis_boundaries = {{nb:String}}
-      AND location_end_date = ''
-      AND ({naics_filter_sql()})
-""", {"nb": neighborhood})
-timings.append(("counting places near you", count_ms))
-place_count = count_rows[0][0]
-
-all_rows, _, all_ms = q(f"""
-    SELECT neighborhoods_analysis_boundaries AS hood,
-           countIf(location_end_date = '' AND ({naics_filter_sql()})) AS n
-    FROM sf_business
-    WHERE hood != '' AND hood != 'Multiple'
-    GROUP BY hood
-    ORDER BY n DESC
-""")
+all_df, all_ms = citywide_gathering_counts()
 timings.append(("comparing to the rest of the city", all_ms))
-all_df = pd.DataFrame(all_rows, columns=["hood", "n"]).reset_index(drop=True)
 all_df["rank"] = range(1, len(all_df) + 1)
 this_row = all_df[all_df["hood"] == neighborhood]
 
-st.markdown(f"## {place_count} places to gather within your zip code")
+st.markdown(
+    f"<div style='font-size:56px;font-weight:700;color:#101722;line-height:1.1;'>"
+    f"{place_count} places to gather here</div>",
+    unsafe_allow_html=True,
+)
 
+context_sentence = ""
 if not this_row.empty and len(all_df) >= 3:
     rank = int(this_row.iloc[0]["rank"])
     pct = rank / len(all_df)
@@ -122,23 +266,37 @@ if not this_row.empty and len(all_df) >= 3:
         phrase, third = "about the same as", "middle"
     else:
         phrase, third = "fewer than most of", "bottom"
-    st.write(f"That's {phrase} San Francisco — you're in the {third} third.")
+    context_sentence = f"That's {phrase} San Francisco — you're in the {third} third."
+    st.markdown(
+        f"<div style='font-size:16px;color:#5A6472;margin-top:-8px;'>{context_sentence}</div>",
+        unsafe_allow_html=True,
+    )
 
-st.divider()
+places_rows, places_ms = open_places(neighborhood)
+timings.append(("finding places here", places_ms))
 
+map_points = []
+for _, name, address, location in places_rows:
+    m = POINT_RE.match(location) if location else None
+    if m:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        map_points.append({"lat": lat, "lon": lon})
+    if len(map_points) >= 500:
+        break
+
+if map_points:
+    st.map(pd.DataFrame(map_points), size=20, color="#2a78d6")
+
+st.write("")
+card_cols = st.columns(3)
+card_cols[0].markdown(stat_card("Open right now", f"{summary['open_now']:,}"), unsafe_allow_html=True)
+card_cols[1].markdown(stat_card("Opened in the last few years", f"{summary['opened_since_2019']:,}"), unsafe_allow_html=True)
+card_cols[2].markdown(stat_card("Closed in the last few years", f"{summary['closed_since_2019']:,}"), unsafe_allow_html=True)
+
+st.write("")
 st.subheader(f"Businesses closing each year in {neighborhood}")
-year_rows, _, year_ms = q("""
-    SELECT toYear(parseDateTimeBestEffortOrNull(location_end_date)) AS yr, count() AS n
-    FROM sf_business
-    WHERE neighborhoods_analysis_boundaries = {nb:String}
-      AND location_end_date != ''
-      AND toYear(parseDateTimeBestEffortOrNull(location_end_date)) BETWEEN 2015 AND 2026
-    GROUP BY yr
-    ORDER BY yr
-""", {"nb": neighborhood})
+year_df, year_ms = closures_per_year(neighborhood)
 timings.append(("building the chart", year_ms))
-year_df = pd.DataFrame(year_rows, columns=["Year", "Businesses closed"]).set_index("Year")
-year_df = year_df.reindex(range(2015, 2027), fill_value=0)
 st.bar_chart(year_df)
 
 st.divider()
@@ -146,18 +304,8 @@ st.divider()
 st.subheader("Places near you")
 st.caption("Restaurants, bars, cafés, gyms, and bookstores that are still open.")
 
-places_rows, _, places_ms = q(f"""
-    SELECT uniqueid, dba_name, full_business_address
-    FROM sf_business
-    WHERE neighborhoods_analysis_boundaries = {{nb:String}}
-      AND location_end_date = ''
-      AND ({naics_filter_sql()})
-    ORDER BY dba_name
-""", {"nb": neighborhood})
-timings.append(("finding places near you", places_ms))
-
 if places_rows:
-    for _, name, address in places_rows:
+    for _, name, address, _location in places_rows:
         st.markdown(f"- **{name}** — {address}")
 else:
     st.write("We couldn't find any open places to gather in this area yet.")
@@ -169,7 +317,7 @@ st.subheader("Invite a friend")
 if places_rows:
     place_labels = [f"{r[1]} — {r[2]}" for r in places_rows]
     place_idx = st.selectbox("Pick a place", range(len(place_labels)), format_func=lambda i: place_labels[i])
-    chosen_id, chosen_name, chosen_addr = places_rows[place_idx]
+    chosen_id, chosen_name, chosen_addr, _chosen_location = places_rows[place_idx]
     evening = st.date_input("Pick an evening")
 
     if "draft" not in st.session_state:
