@@ -1,3 +1,4 @@
+import html
 import os, sys, time, traceback
 import requests
 import streamlit as st
@@ -169,8 +170,32 @@ def alone_friendly_filter_sql():
     return " OR ".join(f"positionCaseInsensitive(dba_name, '{kw}') > 0" for kw in ALONE_FRIENDLY_KEYWORDS)
 
 
+CORPORATE_NAME_EXCLUDE_TERMS = (
+    "Enterprise", "LLC", "Inc", "Corp", "Corporation", "Holdings", "Group",
+    "Consulting", "Services", "Partners", "Management", "Capital", "Investments",
+    "Solutions", "Technologies", "Logistics",
+)
+CORPORATE_ADDRESS_EXCLUDE_TERMS = ("Fl ", "Floor", "Ste ", "Suite")
+PUBLIC_PLACE_TERMS = (
+    "Library", "Center", "Club", "Gym", "Park", "Studio", "Coffee", "Cafe",
+    "Books", "Recreation", "YMCA", "Museum", "Garden", "Church", "Society",
+    "Academy", "Hall", "Guild",
+)
+
+
+def corporate_exclusion_sql():
+    name_excl = " AND ".join(f"dba_name NOT ILIKE '%{t}%'" for t in CORPORATE_NAME_EXCLUDE_TERMS)
+    addr_excl = " AND ".join(f"full_business_address NOT ILIKE '%{t}%'" for t in CORPORATE_ADDRESS_EXCLUDE_TERMS)
+    return f"({name_excl}) AND ({addr_excl})"
+
+
+def public_place_terms_sql():
+    return " OR ".join(f"dba_name ILIKE '%{t}%'" for t in PUBLIC_PLACE_TERMS)
+
+
 def place_filter_sql():
-    return f"(({naics_filter_sql()}) OR ({alone_friendly_filter_sql()}))"
+    inclusion = f"(({naics_filter_sql()}) OR ({alone_friendly_filter_sql()}) OR ({public_place_terms_sql()}))"
+    return f"{inclusion} AND {corporate_exclusion_sql()}"
 
 
 @st.cache_data(ttl=600)
@@ -380,6 +405,10 @@ def empty_state(text):
     st.markdown(f"<div class='empty-state'>{text}</div>", unsafe_allow_html=True)
 
 
+def render_generated_text(text):
+    st.markdown(f"<div class='generated-text'>{html.escape(text)}</div>", unsafe_allow_html=True)
+
+
 FILTER_OPTIONS = ["Show up alone", "Free or low cost", "Anywhere"]
 
 
@@ -436,6 +465,11 @@ def render_body(neighborhood=None, anchor=None):
     hero_hood = hero["hood"] or location_label
     record_shown(hero_name, hero_hood)
 
+    if st.session_state.get("last_hero_id") != hero_id:
+        st.session_state.last_hero_id = hero_id
+        st.session_state.solo_draft = ""
+        st.session_state.invite_drafts = []
+
     if anchor and hero["dist_m"] is not None and hero["dist_m"] / 1609.34 > OUT_OF_SF_MILES:
         st.markdown(
             f"<div class='muted-text' style='margin-bottom:12px;'>You're about "
@@ -467,7 +501,17 @@ def render_body(neighborhood=None, anchor=None):
                 pg_exec("INSERT INTO dismissed_places (place_name) VALUES (%s)", (hero_name,))
             except Exception:
                 st.warning("Couldn't update that just now. Please try again.")
+            st.session_state.solo_draft = ""
+            st.session_state.invite_drafts = []
+            st.session_state.writing_solo = False
+            st.session_state.writing_invite = False
             st.rerun()
+
+        total_count, _total_ms = total_business_count()
+        st.markdown(
+            f"<div class='ch-badge'>⚡ {total_count:,} records scanned in {fetch_ms}ms via ClickHouse Cloud</div>",
+            unsafe_allow_html=True,
+        )
 
     one_of_text = (
         f"One of {len(candidates):,} places near {location_label}."
@@ -507,7 +551,7 @@ def render_body(neighborhood=None, anchor=None):
             st.session_state.writing_solo = False
 
         if st.session_state.solo_draft:
-            st.code(st.session_state.solo_draft, language=None)
+            render_generated_text(st.session_state.solo_draft)
 
         if st.button(
             "Invite someone", key="invite_button",
@@ -534,7 +578,7 @@ def render_body(neighborhood=None, anchor=None):
             st.session_state.writing_invite = False
 
         for draft in st.session_state.invite_drafts:
-            st.code(draft, language=None)
+            render_generated_text(draft)
 
     saved = fetch_saved_places()
     if saved:
@@ -692,6 +736,27 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     font-size: 12px;
     font-weight: 600;
     margin-bottom: 10px;
+}
+
+.generated-text {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px;
+    padding: 16px 18px;
+    color: #F1F5F9;
+    font-size: 15px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    height: auto;
+    margin-bottom: 12px;
+}
+
+.ch-badge {
+    font-size: 12px;
+    color: #94A3B8;
+    margin-top: 12px;
 }
 
 /* ============ unified control system ============ */
