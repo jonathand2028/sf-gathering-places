@@ -145,6 +145,20 @@ def category_label(naics):
     return "Gathering spot"
 
 
+JUNK_TOKENS = ("LLC", "INC", "CORP", "TRUST")
+
+
+def is_junk_name(name, address):
+    if not name:
+        return True
+    if name[0].isdigit():
+        return True
+    if name.strip().lower() == (address or "").strip().lower():
+        return True
+    upper = name.upper()
+    return any(token in upper for token in JUNK_TOKENS)
+
+
 def section_label(text):
     st.markdown(f"<div class='section-label'>{text}</div>", unsafe_allow_html=True)
 
@@ -156,7 +170,7 @@ def empty_state(text):
 def render_neighborhood(neighborhood):
     places_rows, _places_ms = open_places(neighborhood)
     dismissed = fetch_dismissed_names()
-    candidates = [p for p in places_rows if p[1] not in dismissed]
+    candidates = [p for p in places_rows if p[1] not in dismissed and not is_junk_name(p[1], p[2])]
 
     if not candidates:
         empty_state("No open places to gather here yet. Try another neighborhood.")
