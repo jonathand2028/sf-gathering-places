@@ -193,7 +193,7 @@ def render_saved_places():
         return
     section_label("Your list")
     for saved_id, place_name, address, neighborhood in saved:
-        with st.container(border=True):
+        with st.container(border=True, key=f"saved_row_{saved_id}"):
             col1, col2 = st.columns([5, 1])
             col1.markdown(f"**{place_name}** — {address} ({neighborhood})")
             if col2.button("Remove", key=f"remove_{saved_id}"):
@@ -216,7 +216,10 @@ html, body, [class*="css"] {
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }
 
-.stApp { background-color: #0E1116; }
+.stApp {
+    background: linear-gradient(180deg, #0B0D11 0%, #14171E 100%);
+    background-attachment: fixed;
+}
 
 .block-container {
     max-width: 1080px;
@@ -231,9 +234,17 @@ html, body, [class*="css"] {
 
 h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
 
+.eyebrow {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-weight: 600;
+    color: #FF6B4A;
+    margin-bottom: 8px;
+}
 .page-title {
-    font-size: 40px;
-    font-weight: 700;
+    font-size: 44px;
+    font-weight: 800;
     letter-spacing: -0.03em;
     color: #F2F4F7;
     margin-bottom: 4px;
@@ -256,7 +267,7 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
     color: #8B95A5;
 }
 .hero-name {
-    font-size: 32px;
+    font-size: 30px;
     font-weight: 700;
     color: #F2F4F7;
     line-height: 1.2;
@@ -269,16 +280,19 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
 }
 
 /* cards */
-.st-key-hero_card, .st-key-invite_card {
+.st-key-hero_card, .st-key-invite_card, [class*="st-key-saved_row_"] {
     background: #171B22 !important;
     border: 1px solid #242A33 !important;
     border-radius: 14px !important;
-    padding: 28px !important;
-    margin-bottom: 12px !important;
-    box-shadow: none !important;
+    padding: 32px !important;
+    margin-bottom: 20px !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px -16px rgba(0,0,0,0.8) !important;
 }
 .st-key-hero_card {
     border-left: 2px solid #FF6B4A !important;
+    background:
+        radial-gradient(600px circle at 20% 0%, rgba(255,107,74,0.10), transparent 60%),
+        #171B22 !important;
 }
 
 .empty-state {
@@ -328,6 +342,7 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
 </style>
 """, unsafe_allow_html=True)
 
+st.markdown("<div class='eyebrow'>San Francisco</div>", unsafe_allow_html=True)
 st.markdown("<div class='page-title'>SF Gathering Places</div>", unsafe_allow_html=True)
 st.markdown("<div class='page-subtitle'>Find one place near you, and someone to go with.</div>", unsafe_allow_html=True)
 
