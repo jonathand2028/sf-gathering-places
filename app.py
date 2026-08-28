@@ -100,52 +100,45 @@ if save_col2.button(f"Save '{neighborhood}'"):
 
 st.divider()
 
-# ---------- section 1: open / closed / rank / closures-per-year ----------
-st.header("1. Neighborhood health")
+# ---------- section 1: compare this neighborhood against all others ----------
+st.header("1. Compare neighborhoods")
 
-open_rows, _, open_ms = q("""
-    SELECT count() FROM sf_business
-    WHERE neighborhoods_analysis_boundaries = {nb:String} AND location_end_date = ''
-""", {"nb": neighborhood})
-open_count = open_rows[0][0]
-
-closed_since_rows, _, closed_since_ms = q("""
-    SELECT count() FROM sf_business
-    WHERE neighborhoods_analysis_boundaries = {nb:String}
-      AND location_end_date != ''
-      AND parseDateTimeBestEffortOrNull(location_end_date) >= toDate('2019-01-01')
-""", {"nb": neighborhood})
-closed_since_count = closed_since_rows[0][0]
-
-rank_rows, _, rank_ms = q("""
+agg_rows, _, agg_ms = q("""
     SELECT neighborhoods_analysis_boundaries,
-           countIf(location_end_date != '') AS closed,
-           count() AS total,
-           closed / total AS pct_lost
+           countIf(location_end_date = '') AS open_now,
+           countIf(location_start_date != ''
+                   AND parseDateTimeBestEffortOrNull(location_start_date) >= toDate('2019-01-01')) AS opened_since_2019,
+           countIf(location_end_date != ''
+                   AND parseDateTimeBestEffortOrNull(location_end_date) >= toDate('2019-01-01')) AS closed_since_2019,
+           count() AS total
     FROM sf_business
     WHERE neighborhoods_analysis_boundaries != ''
     GROUP BY neighborhoods_analysis_boundaries
     HAVING total >= 20
-    ORDER BY pct_lost DESC
 """)
-rank_df = pd.DataFrame(rank_rows, columns=["neighborhood", "closed", "total", "pct_lost"])
-rank_df["rank"] = range(1, len(rank_df) + 1)
-this_rank_row = rank_df[rank_df["neighborhood"] == neighborhood]
+agg_df = pd.DataFrame(agg_rows, columns=["neighborhood", "open_now", "opened_since_2019", "closed_since_2019", "total"])
+agg_df["net_change"] = agg_df["opened_since_2019"] - agg_df["closed_since_2019"]
+agg_df = agg_df.sort_values("net_change", ascending=False).reset_index(drop=True)
+agg_df["rank"] = agg_df.index + 1
+this_row = agg_df[agg_df["neighborhood"] == neighborhood]
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Still open", f"{open_count:,}", help=f"{open_ms} ms")
-c2.metric("Closed since 2019", f"{closed_since_count:,}", help=f"{closed_since_ms} ms")
-if not this_rank_row.empty:
-    rnk = int(this_rank_row.iloc[0]["rank"])
-    pct = this_rank_row.iloc[0]["pct_lost"] * 100
-    c3.metric(
-        "Rank by % lost",
-        f"#{rnk} of {len(rank_df)}",
-        help=f"{pct:.1f}% of all businesses ever registered here have closed ({rank_ms} ms)",
+c1, c2, c3, c4 = st.columns(4)
+if not this_row.empty:
+    row = this_row.iloc[0]
+    c1.metric("Open now", f"{int(row['open_now']):,}", help=f"{agg_ms} ms")
+    c2.metric("Opened since 2019", f"{int(row['opened_since_2019']):,}")
+    c3.metric("Closed since 2019", f"{int(row['closed_since_2019']):,}")
+    net = int(row["net_change"])
+    c4.metric(
+        "Net change since 2019",
+        f"{net:+,}",
+        help=f"Ranked #{int(row['rank'])} of {len(agg_df)} neighborhoods by net change (opened minus closed since 2019)",
     )
 else:
-    c3.metric("Rank by % lost", "n/a (small sample)", help=f"{rank_ms} ms")
+    st.info("Not enough data to compare this neighborhood.")
 
+st.subheader("Closures per year")
+st.caption("Raw count of closures by year — reflects reporting patterns as well as actual closures, not a trend claim.")
 year_rows, _, year_ms = q("""
     SELECT toYear(parseDateTimeBestEffortOrNull(location_end_date)) AS yr, count() AS n
     FROM sf_business
