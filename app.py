@@ -178,6 +178,137 @@ def stat_card(label, value):
     """
 
 
+def render_neighborhood(neighborhood, timings):
+    summary, summary_ms = neighborhood_summary(neighborhood)
+    timings.append(("counting places here", summary_ms))
+    place_count = summary["open_now"]
+
+    all_df, all_ms = citywide_gathering_counts()
+    timings.append(("comparing to the rest of the city", all_ms))
+    all_df["rank"] = range(1, len(all_df) + 1)
+    this_row = all_df[all_df["hood"] == neighborhood]
+
+    st.markdown(
+        f"<div style='font-size:56px;font-weight:700;color:#101722;line-height:1.1;'>"
+        f"{place_count} places to gather here</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not this_row.empty and len(all_df) >= 3:
+        rank = int(this_row.iloc[0]["rank"])
+        pct = rank / len(all_df)
+        if pct <= 1 / 3:
+            phrase, third = "more than most of", "top"
+        elif pct <= 2 / 3:
+            phrase, third = "about the same as", "middle"
+        else:
+            phrase, third = "fewer than most of", "bottom"
+        context_sentence = f"That's {phrase} San Francisco — you're in the {third} third."
+        st.markdown(
+            f"<div style='font-size:16px;color:#5A6472;margin-top:-8px;'>{context_sentence}</div>",
+            unsafe_allow_html=True,
+        )
+
+    places_rows, places_ms = open_places(neighborhood)
+    timings.append(("finding places here", places_ms))
+
+    map_points = []
+    for _, name, address, location in places_rows:
+        m = POINT_RE.match(location) if location else None
+        if m:
+            lon, lat = float(m.group(1)), float(m.group(2))
+            map_points.append({"lat": lat, "lon": lon})
+        if len(map_points) >= 500:
+            break
+
+    if map_points:
+        st.map(pd.DataFrame(map_points), size=20, color="#2a78d6")
+
+    st.write("")
+    card_cols = st.columns(3)
+    card_cols[0].markdown(stat_card("Open right now", f"{summary['open_now']:,}"), unsafe_allow_html=True)
+    card_cols[1].markdown(stat_card("Opened in the last few years", f"{summary['opened_since_2019']:,}"), unsafe_allow_html=True)
+    card_cols[2].markdown(stat_card("Closed in the last few years", f"{summary['closed_since_2019']:,}"), unsafe_allow_html=True)
+
+    st.write("")
+    st.subheader(f"Businesses closing each year in {neighborhood}")
+    year_df, year_ms = closures_per_year(neighborhood)
+    timings.append(("building the chart", year_ms))
+    st.bar_chart(year_df)
+
+    st.divider()
+
+    st.subheader("Places near you")
+    st.caption("Restaurants, bars, cafés, gyms, and bookstores that are still open.")
+
+    if places_rows:
+        for _, name, address, _location in places_rows:
+            st.markdown(f"- **{name}** — {address}")
+    else:
+        st.write("We couldn't find any open places to gather in this area yet.")
+
+    st.divider()
+
+    st.subheader("Invite a friend")
+
+    if places_rows:
+        place_labels = [f"{r[1]} — {r[2]}" for r in places_rows]
+        place_idx = st.selectbox("Pick a place", range(len(place_labels)), format_func=lambda i: place_labels[i])
+        chosen_id, chosen_name, chosen_addr, _chosen_location = places_rows[place_idx]
+        evening = st.date_input("Pick an evening")
+
+        if "draft" not in st.session_state:
+            st.session_state.draft = ""
+
+        if st.button("Write an invite for me"):
+            api_key = secret("GEMINI_API_KEY")
+            prompt = (
+                f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
+                f"to hang out at '{chosen_name}' ({chosen_addr}) in San Francisco on {evening.strftime('%A, %B %d')}. "
+                f"Keep it warm and easygoing, no pressure to say yes, no exclamation-point overload. "
+                f"Just output the text message itself, nothing else."
+            )
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-flash-lite-latest:generateContent?key={api_key}"
+            )
+            t0 = time.time()
+            try:
+                resp = requests.post(
+                    url,
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                    timeout=30,
+                )
+                gemini_ms = int((time.time() - t0) * 1000)
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                st.session_state.draft = text
+                timings.append(("writing your invite", gemini_ms))
+            except Exception:
+                st.error("Something went wrong writing your invite. Please try again.")
+
+        if st.session_state.draft:
+            st.write(st.session_state.draft)
+
+        if st.button("I'm going"):
+            night_str = evening.isoformat()
+            with pg().cursor() as c:
+                c.execute(
+                    "INSERT INTO attendances (place_id, place_name, night) VALUES (%s, %s, %s)",
+                    (chosen_id, chosen_name, night_str),
+                )
+                c.execute(
+                    "SELECT count(*) FROM attendances WHERE place_id = %s AND night = %s",
+                    (chosen_id, night_str),
+                )
+                same_count = c.fetchone()[0]
+            st.success(f"You're going! {same_count} {'person has' if same_count == 1 else 'people have'} also picked "
+                       f"{chosen_name} on {evening.strftime('%A, %B %d')}.")
+    else:
+        st.info("No open places to gather here yet, so there's nothing to invite a friend to.")
+
+
 st.markdown("""
 <style>
 #MainMenu, header, footer {visibility: hidden;}
@@ -221,18 +352,21 @@ for col, (label, hood) in zip(chip_cols, NEIGHBORHOOD_CHIPS):
 search_text = st.text_input("Or type a zip code or neighborhood", placeholder="94110 or Mission")
 if search_text and search_text != st.session_state.last_search:
     st.session_state.last_search = search_text
-    names, names_ms = all_neighborhood_names()
-    timings.append(("looking up neighborhoods", names_ms))
-    cleaned = search_text.strip()
-    if cleaned.isdigit() and len(cleaned) == 5:
-        match, zip_ms = zip_to_neighborhood(cleaned)
-        timings.append(("matching your zip code", zip_ms))
-    else:
-        match = fuzzy_match_neighborhood(cleaned, names)
-    if match:
-        st.session_state.neighborhood = match
-    else:
-        st.warning(f"We couldn't match \"{search_text}\" to a San Francisco neighborhood or zip code.")
+    try:
+        names, names_ms = all_neighborhood_names()
+        timings.append(("looking up neighborhoods", names_ms))
+        cleaned = search_text.strip()
+        if cleaned.isdigit() and len(cleaned) == 5:
+            match, zip_ms = zip_to_neighborhood(cleaned)
+            timings.append(("matching your zip code", zip_ms))
+        else:
+            match = fuzzy_match_neighborhood(cleaned, names)
+        if match:
+            st.session_state.neighborhood = match
+        else:
+            st.warning(f"We couldn't match \"{search_text}\" to a San Francisco neighborhood or zip code.")
+    except Exception:
+        st.error("We're having trouble reaching our data right now. Please try again in a moment.")
 
 neighborhood = st.session_state.neighborhood
 if not neighborhood:
@@ -241,134 +375,28 @@ if not neighborhood:
 
 st.header(f"You're looking at {neighborhood}.")
 
-summary, summary_ms = neighborhood_summary(neighborhood)
-timings.append(("counting places here", summary_ms))
-place_count = summary["open_now"]
-
-all_df, all_ms = citywide_gathering_counts()
-timings.append(("comparing to the rest of the city", all_ms))
-all_df["rank"] = range(1, len(all_df) + 1)
-this_row = all_df[all_df["hood"] == neighborhood]
-
-st.markdown(
-    f"<div style='font-size:56px;font-weight:700;color:#101722;line-height:1.1;'>"
-    f"{place_count} places to gather here</div>",
-    unsafe_allow_html=True,
-)
-
-context_sentence = ""
-if not this_row.empty and len(all_df) >= 3:
-    rank = int(this_row.iloc[0]["rank"])
-    pct = rank / len(all_df)
-    if pct <= 1 / 3:
-        phrase, third = "more than most of", "top"
-    elif pct <= 2 / 3:
-        phrase, third = "about the same as", "middle"
-    else:
-        phrase, third = "fewer than most of", "bottom"
-    context_sentence = f"That's {phrase} San Francisco — you're in the {third} third."
-    st.markdown(
-        f"<div style='font-size:16px;color:#5A6472;margin-top:-8px;'>{context_sentence}</div>",
-        unsafe_allow_html=True,
-    )
-
-places_rows, places_ms = open_places(neighborhood)
-timings.append(("finding places here", places_ms))
-
-map_points = []
-for _, name, address, location in places_rows:
-    m = POINT_RE.match(location) if location else None
-    if m:
-        lon, lat = float(m.group(1)), float(m.group(2))
-        map_points.append({"lat": lat, "lon": lon})
-    if len(map_points) >= 500:
-        break
-
-if map_points:
-    st.map(pd.DataFrame(map_points), size=20, color="#2a78d6")
-
-st.write("")
-card_cols = st.columns(3)
-card_cols[0].markdown(stat_card("Open right now", f"{summary['open_now']:,}"), unsafe_allow_html=True)
-card_cols[1].markdown(stat_card("Opened in the last few years", f"{summary['opened_since_2019']:,}"), unsafe_allow_html=True)
-card_cols[2].markdown(stat_card("Closed in the last few years", f"{summary['closed_since_2019']:,}"), unsafe_allow_html=True)
-
-st.write("")
-st.subheader(f"Businesses closing each year in {neighborhood}")
-year_df, year_ms = closures_per_year(neighborhood)
-timings.append(("building the chart", year_ms))
-st.bar_chart(year_df)
-
-st.divider()
-
-st.subheader("Places near you")
-st.caption("Restaurants, bars, cafés, gyms, and bookstores that are still open.")
-
-if places_rows:
-    for _, name, address, _location in places_rows:
-        st.markdown(f"- **{name}** — {address}")
-else:
-    st.write("We couldn't find any open places to gather in this area yet.")
-
-st.divider()
-
-st.subheader("Invite a friend")
-
-if places_rows:
-    place_labels = [f"{r[1]} — {r[2]}" for r in places_rows]
-    place_idx = st.selectbox("Pick a place", range(len(place_labels)), format_func=lambda i: place_labels[i])
-    chosen_id, chosen_name, chosen_addr, _chosen_location = places_rows[place_idx]
-    evening = st.date_input("Pick an evening")
-
-    if "draft" not in st.session_state:
-        st.session_state.draft = ""
-
-    if st.button("Write an invite for me"):
-        api_key = secret("GEMINI_API_KEY")
-        prompt = (
-            f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
-            f"to hang out at '{chosen_name}' ({chosen_addr}) in San Francisco on {evening.strftime('%A, %B %d')}. "
-            f"Keep it warm and easygoing, no pressure to say yes, no exclamation-point overload. "
-            f"Just output the text message itself, nothing else."
-        )
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-flash-lite-latest:generateContent?key={api_key}"
-        )
-        t0 = time.time()
-        try:
-            resp = requests.post(
-                url,
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=30,
-            )
-            gemini_ms = int((time.time() - t0) * 1000)
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            st.session_state.draft = text
-            timings.append(("writing your invite", gemini_ms))
-        except Exception:
-            st.error("Something went wrong writing your invite. Please try again.")
-
-    if st.session_state.draft:
-        st.write(st.session_state.draft)
-
-    if st.button("I'm going"):
-        night_str = evening.isoformat()
-        with pg().cursor() as c:
-            c.execute(
-                "INSERT INTO attendances (place_id, place_name, night) VALUES (%s, %s, %s)",
-                (chosen_id, chosen_name, night_str),
-            )
-            c.execute(
-                "SELECT count(*) FROM attendances WHERE place_id = %s AND night = %s",
-                (chosen_id, night_str),
-            )
-            same_count = c.fetchone()[0]
-        st.success(f"You're going! {same_count} {'person has' if same_count == 1 else 'people have'} also picked "
-                   f"{chosen_name} on {evening.strftime('%A, %B %d')}.")
-else:
-    st.info("No open places to gather here yet, so there's nothing to invite a friend to.")
+try:
+    render_neighborhood(neighborhood, timings)
+except Exception:
+    st.error("We're having trouble reaching our data right now. Please try again in a moment.")
 
 st.caption(" · ".join(f"{label}: {ms} ms" for label, ms in timings))
+
+health_parts = []
+try:
+    t0 = time.time()
+    ch().query("SELECT 1")
+    ch_ms = int((time.time() - t0) * 1000)
+    health_parts.append(f"ClickHouse: connected ({ch_ms} ms)")
+except Exception as e:
+    health_parts.append(f"ClickHouse: unreachable — {e}")
+
+try:
+    with pg().cursor() as c:
+        c.execute("SELECT count(*) FROM attendances")
+        rsvp_count = c.fetchone()[0]
+    health_parts.append(f"Postgres: connected — {rsvp_count} saved RSVPs")
+except Exception as e:
+    health_parts.append(f"Postgres: unreachable — {e}")
+
+st.caption(" · ".join(health_parts))
