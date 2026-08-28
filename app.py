@@ -255,29 +255,6 @@ def total_business_count():
 BAY_AREA_VIEWBOX = "-122.6,37.9,-122.2,37.6"  # left,top,right,bottom: covers SF, Oakland, Berkeley, the Peninsula
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def geocode(query):
-    """Returns (lat, lon, display_name) or None. Biased to the Bay Area but not
-    limited to San Francisco -- Oakland/Berkeley/Peninsula addresses still resolve."""
-    try:
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": query, "format": "json", "limit": 1, "countrycodes": "us",
-                "viewbox": BAY_AREA_VIEWBOX, "bounded": 1,
-            },
-            headers={"User-Agent": "SFGatheringPlaces/1.0 (hackathon project)"},
-            timeout=6,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
-    except Exception:
-        return None
-
-
 STREET_ABBREV = {
     "Street": "St", "Avenue": "Ave", "Boulevard": "Blvd", "Drive": "Dr",
     "Road": "Rd", "Lane": "Ln", "Court": "Ct", "Place": "Pl", "Terrace": "Ter",
@@ -311,20 +288,6 @@ def clean_address_display(raw_str):
     return ", ".join(cleaned)
 
 
-def match_neighborhood_name(text):
-    q = text.strip().lower()
-    for h in ALL_HOODS:
-        if h.lower() == q:
-            return h
-    for h in ALL_HOODS:
-        if h.lower().startswith(q):
-            return h
-    for h in ALL_HOODS:
-        if q in h.lower():
-            return h
-    return None
-
-
 def format_distance(dist_m):
     miles = dist_m / 1609.34
     if miles <= 2:
@@ -350,6 +313,72 @@ def neighborhood_anchor_coords():
         record_error(sql, e)
         raise
     return {row[0]: (row[1], row[2]) for row in r.result_rows}
+
+
+def _nominatim_matches(query, limit=5):
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": query, "format": "json", "limit": limit, "countrycodes": "us",
+                "viewbox": BAY_AREA_VIEWBOX, "bounded": 1,
+            },
+            headers={"User-Agent": "SFGatheringPlaces/1.0 (hackathon project)"},
+            timeout=6,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_suggestions(query):
+    """Returns up to 5 (label, lat, lon) candidates: SF zips, matching
+    neighborhoods, then Nominatim matches within the Bay Area viewbox."""
+    cleaned = query.strip()
+    if len(cleaned) < 2:
+        return []
+
+    results = []
+    seen = set()
+
+    def add(label, lat, lon):
+        key = label.lower()
+        if key not in seen:
+            seen.add(key)
+            results.append((label, lat, lon))
+
+    if cleaned.isdigit() and len(cleaned) == 5 and cleaned in SF_ZIP_COORDS:
+        lon, lat = SF_ZIP_COORDS[cleaned]
+        add(f"{cleaned}, San Francisco, CA", lat, lon)
+        return results
+
+    for hood in ALL_HOODS:
+        if len(results) >= 5:
+            break
+        if cleaned.lower() in hood.lower():
+            try:
+                coords = neighborhood_anchor_coords().get(hood)
+            except Exception:
+                coords = None
+            if coords:
+                lon, lat = coords
+                add(hood, lat, lon)
+
+    if len(results) < 5:
+        for q in (cleaned, f"{cleaned}, San Francisco, CA"):
+            if len(results) >= 5:
+                break
+            for item in _nominatim_matches(q, limit=5):
+                if len(results) >= 5:
+                    break
+                try:
+                    add(clean_address_display(item["display_name"]), float(item["lat"]), float(item["lon"]))
+                except (KeyError, ValueError):
+                    continue
+
+    return results[:5]
 
 
 @st.cache_data(ttl=600)
@@ -1063,10 +1092,15 @@ if "prev_dropdown" not in st.session_state:
     st.session_state.prev_dropdown = None
 if "prev_search" not in st.session_state:
     st.session_state.prev_search = ""
+if "prev_suggestion" not in st.session_state:
+    st.session_state.prev_suggestion = None
+if "pending_suggestions" not in st.session_state:
+    st.session_state.pending_suggestions = []
 
 cur_pills = st.session_state.get("neighborhood_pills")
 cur_dropdown = st.session_state.get("neighborhood_dropdown")
 cur_search = st.session_state.get("search_box", "")
+cur_suggestion = st.session_state.get("address_suggestion")
 
 search_warning = None
 
@@ -1075,59 +1109,47 @@ if cur_pills != st.session_state.prev_pills and cur_pills is not None:
     st.session_state.anchor = None
     st.session_state.neighborhood_dropdown = None
     st.session_state.search_box = ""
+    st.session_state.pending_suggestions = []
+    st.session_state.address_suggestion = None
+    cur_suggestion = None
 elif cur_dropdown != st.session_state.prev_dropdown and cur_dropdown is not None:
     st.session_state.neighborhood = cur_dropdown
     st.session_state.anchor = None
     st.session_state.neighborhood_pills = None
     st.session_state.search_box = ""
+    st.session_state.pending_suggestions = []
+    st.session_state.address_suggestion = None
+    cur_suggestion = None
+elif cur_suggestion != st.session_state.prev_suggestion and cur_suggestion is not None:
+    match = next((s for s in st.session_state.pending_suggestions if s[0] == cur_suggestion), None)
+    if match:
+        _label, s_lat, s_lon = match
+        st.session_state.anchor = {"lat": s_lat, "lon": s_lon, "label": cur_suggestion}
+        st.session_state.neighborhood = None
+        st.session_state.neighborhood_pills = None
+        st.session_state.neighborhood_dropdown = None
 elif cur_search != st.session_state.prev_search and cur_search:
     cleaned = cur_search.strip()
-    if cleaned.isdigit() and len(cleaned) == 5:
-        if cleaned in SF_ZIP_COORDS:
-            lon, lat = SF_ZIP_COORDS[cleaned]
-            st.session_state.anchor = {"lat": lat, "lon": lon, "label": f"{cleaned}, San Francisco, CA"}
+    if len(cleaned) >= 2:
+        suggestions = fetch_suggestions(cleaned)
+        st.session_state.pending_suggestions = suggestions
+        if suggestions:
+            label, lat, lon = suggestions[0]
+            st.session_state.anchor = {"lat": lat, "lon": lon, "label": label}
             st.session_state.neighborhood = None
             st.session_state.neighborhood_pills = None
             st.session_state.neighborhood_dropdown = None
+            st.session_state.address_suggestion = label
+            cur_suggestion = label
         else:
-            result = geocode(f"{cleaned}, CA, USA")
-            if result:
-                lat, lon, display = result
-                st.session_state.anchor = {"lat": lat, "lon": lon, "label": clean_address_display(display)}
-                st.session_state.neighborhood = None
-                st.session_state.neighborhood_pills = None
-                st.session_state.neighborhood_dropdown = None
-            else:
-                search_warning = "We couldn't find that zip code. Try a different one or pick a neighborhood above."
+            search_warning = "We couldn't find that address. Try a zip code or pick a neighborhood above."
     else:
-        matched_hood = match_neighborhood_name(cleaned)
-        if matched_hood:
-            try:
-                coords = neighborhood_anchor_coords().get(matched_hood)
-            except Exception:
-                coords = None
-            if coords:
-                lon, lat = coords
-                st.session_state.anchor = {"lat": lat, "lon": lon, "label": matched_hood}
-                st.session_state.neighborhood = None
-                st.session_state.neighborhood_pills = None
-                st.session_state.neighborhood_dropdown = None
-            else:
-                search_warning = "We're having trouble reaching our data right now. Please try again in a moment."
-        else:
-            result = geocode(cleaned)
-            if result:
-                lat, lon, display = result
-                st.session_state.anchor = {"lat": lat, "lon": lon, "label": clean_address_display(display)}
-                st.session_state.neighborhood = None
-                st.session_state.neighborhood_pills = None
-                st.session_state.neighborhood_dropdown = None
-            else:
-                search_warning = "We couldn't find that address. Try a zip code or pick a neighborhood above."
+        st.session_state.pending_suggestions = []
 
 st.session_state.prev_pills = cur_pills
 st.session_state.prev_dropdown = cur_dropdown
 st.session_state.prev_search = cur_search
+st.session_state.prev_suggestion = cur_suggestion
 
 if chip_hoods:
     st.markdown("<div class='chip-caption'>The neighborhoods with the most places to gather</div>", unsafe_allow_html=True)
@@ -1150,11 +1172,21 @@ st.selectbox(
 )
 
 st.text_input(
-    "Search SF or Bay Area address, ZIP, or neighborhood",
-    placeholder="Search SF or Bay Area address, ZIP (e.g. 94115), or neighborhood...",
+    "Type address, street, ZIP, or neighborhood",
+    placeholder="Type address, street (e.g. Valencia, Sonia), ZIP, or neighborhood...",
     key="search_box",
     label_visibility="collapsed",
 )
+
+if st.session_state.pending_suggestions:
+    suggestion_labels = [label for label, _lat, _lon in st.session_state.pending_suggestions]
+    st.selectbox(
+        "Matching Bay Area addresses — pick one:",
+        options=suggestion_labels,
+        index=0,
+        key="address_suggestion",
+    )
+
 if search_warning:
     st.warning(search_warning)
 
