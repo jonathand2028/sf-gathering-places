@@ -1,4 +1,4 @@
-import os, re, time
+import os, re, time, datetime
 import requests
 import streamlit as st
 import pandas as pd
@@ -91,23 +91,15 @@ def zip_to_neighborhood(zip_code):
 
 
 @st.cache_data(ttl=300)
-def neighborhood_summary(neighborhood):
+def open_place_count(neighborhood):
     t0 = time.time()
     r = ch().query(f"""
-        SELECT
-            countIf(location_end_date = '' AND ({naics_filter_sql()})) AS open_now,
-            countIf(location_start_date != ''
-                    AND parseDateTimeBestEffortOrNull(location_start_date) >= toDate('2019-01-01')
-                    AND ({naics_filter_sql()})) AS opened_since_2019,
-            countIf(location_end_date != ''
-                    AND parseDateTimeBestEffortOrNull(location_end_date) >= toDate('2019-01-01')
-                    AND ({naics_filter_sql()})) AS closed_since_2019
+        SELECT countIf(location_end_date = '' AND ({naics_filter_sql()})) AS open_now
         FROM sf_business
         WHERE neighborhoods_analysis_boundaries = {{nb:String}}
     """, parameters={"nb": neighborhood})
     ms = int((time.time() - t0) * 1000)
-    open_now, opened_since, closed_since = r.result_rows[0]
-    return {"open_now": open_now, "opened_since_2019": opened_since, "closed_since_2019": closed_since}, ms
+    return r.result_rows[0][0], ms
 
 
 @st.cache_data(ttl=300)
@@ -126,27 +118,11 @@ def citywide_gathering_counts():
 
 
 @st.cache_data(ttl=300)
-def closures_per_year(neighborhood):
-    t0 = time.time()
-    r = ch().query("""
-        SELECT toYear(parseDateTimeBestEffortOrNull(location_end_date)) AS yr, count() AS n
-        FROM sf_business
-        WHERE neighborhoods_analysis_boundaries = {nb:String}
-          AND location_end_date != ''
-          AND toYear(parseDateTimeBestEffortOrNull(location_end_date)) BETWEEN 2015 AND 2026
-        GROUP BY yr
-        ORDER BY yr
-    """, parameters={"nb": neighborhood})
-    ms = int((time.time() - t0) * 1000)
-    df = pd.DataFrame(r.result_rows, columns=["Year", "Businesses closed"]).set_index("Year")
-    return df.reindex(range(2015, 2027), fill_value=0), ms
-
-
-@st.cache_data(ttl=300)
 def open_places(neighborhood):
     t0 = time.time()
     r = ch().query(f"""
-        SELECT uniqueid, dba_name, full_business_address, location
+        SELECT uniqueid, dba_name, full_business_address, location,
+               self_reported_naics_code, location_start_date
         FROM sf_business
         WHERE neighborhoods_analysis_boundaries = {{nb:String}}
           AND location_end_date = ''
@@ -155,6 +131,41 @@ def open_places(neighborhood):
     """, parameters={"nb": neighborhood})
     ms = int((time.time() - t0) * 1000)
     return r.result_rows, ms
+
+
+def fetch_rsvp_counts():
+    with pg().cursor() as c:
+        c.execute("SELECT place_id, count(*) FROM attendances GROUP BY place_id")
+        return dict(c.fetchall())
+
+
+def build_place_order(places_rows, rsvp_counts):
+    with_rsvp = [i for i, p in enumerate(places_rows) if rsvp_counts.get(p[0], 0) > 0]
+    with_rsvp.sort(key=lambda i: -rsvp_counts.get(places_rows[i][0], 0))
+    without_rsvp = [i for i in range(len(places_rows)) if i not in with_rsvp]
+    return with_rsvp + without_rsvp
+
+
+def category_label(naics):
+    if naics.startswith("7224"):
+        return "Bar"
+    if naics.startswith("7225"):
+        return "Restaurant or café"
+    if naics.startswith("7139"):
+        return "Gym or fitness studio"
+    if naics.startswith("4512") or naics.startswith("4592"):
+        return "Bookstore"
+    return "Gathering spot"
+
+
+UPCOMING_DAYS = ["Tue", "Wed", "Thu", "Fri", "Sat"]
+WEEKDAY_INDEX = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+
+
+def upcoming_date(day_abbr):
+    today = datetime.date.today()
+    delta = (WEEKDAY_INDEX[day_abbr] - today.weekday()) % 7
+    return today + datetime.timedelta(days=delta)
 
 
 def fuzzy_match_neighborhood(text, names):
@@ -184,89 +195,82 @@ def success_banner(text):
 
 
 def render_neighborhood(neighborhood, timings):
-    summary, summary_ms = neighborhood_summary(neighborhood)
-    timings.append(("counting places here", summary_ms))
-    place_count = summary["open_now"]
-
-    all_df, all_ms = citywide_gathering_counts()
-    timings.append(("comparing to the rest of the city", all_ms))
-    all_df["rank"] = range(1, len(all_df) + 1)
-    this_row = all_df[all_df["hood"] == neighborhood]
-
-    with st.container(border=True, key="overview_card"):
-        section_label("Overview")
-        st.markdown(f"<div class='headline-number'>{place_count} places to gather here</div>", unsafe_allow_html=True)
-        if not this_row.empty and len(all_df) >= 3:
-            rank = int(this_row.iloc[0]["rank"])
-            pct = rank / len(all_df)
-            if pct <= 1 / 3:
-                phrase, third = "more than most of", "top"
-            elif pct <= 2 / 3:
-                phrase, third = "about the same as", "middle"
-            else:
-                phrase, third = "fewer than most of", "bottom"
-            st.markdown(
-                f"<div class='muted-text'>That's {phrase} San Francisco — you're in the {third} third.</div>",
-                unsafe_allow_html=True,
-            )
-
     places_rows, places_ms = open_places(neighborhood)
     timings.append(("finding places here", places_ms))
 
-    map_points = []
-    for _, name, address, location in places_rows:
-        m = POINT_RE.match(location) if location else None
-        if m:
-            lon, lat = float(m.group(1)), float(m.group(2))
-            map_points.append({"lat": lat, "lon": lon})
-        if len(map_points) >= 500:
-            break
+    if not places_rows:
+        empty_state("No open places to gather here yet. Try another neighborhood.")
+        return
 
-    if map_points:
-        with st.container(border=True, key="map_card"):
-            section_label("Map")
-            st.map(pd.DataFrame(map_points), size=20, color="#0070F3")
+    rsvp_counts = fetch_rsvp_counts()
+    order = build_place_order(places_rows, rsvp_counts)
 
-    with st.container(border=True, key="stats_card"):
-        section_label("At a glance")
-        stat_cols = st.columns(3)
-        stat_cols[0].metric("Open right now", f"{summary['open_now']:,}")
-        stat_cols[1].metric("Opened in the last few years", f"{summary['opened_since_2019']:,}")
-        stat_cols[2].metric("Closed in the last few years", f"{summary['closed_since_2019']:,}")
+    if "hero_offset" not in st.session_state:
+        st.session_state.hero_offset = {}
+    offset = st.session_state.hero_offset.get(neighborhood, 0)
+    hero_idx = order[offset % len(order)]
+    hero_place = places_rows[hero_idx]
+    hero_id, hero_name, hero_addr, _hero_location, hero_naics, hero_start = hero_place
 
-    with st.container(border=True, key="chart_card"):
-        section_label("Trends")
-        st.markdown(f"<div class='card-title'>Businesses closing each year in {neighborhood}</div>", unsafe_allow_html=True)
-        year_df, year_ms = closures_per_year(neighborhood)
-        timings.append(("building the chart", year_ms))
-        st.bar_chart(year_df)
+    with st.container(border=True, key="hero_card"):
+        section_label("Tonight's pick")
+        st.markdown(f"<div class='hero-name'>{hero_name}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='muted-text'>{hero_addr}</div>", unsafe_allow_html=True)
+        meta_bits = [category_label(hero_naics)]
+        if hero_start:
+            meta_bits.append(f"open since {hero_start[:4]}")
+        st.markdown(f"<div class='muted-text'>{' · '.join(meta_bits)}</div>", unsafe_allow_html=True)
+        if st.button("Show me another", key="show_another"):
+            st.session_state.hero_offset[neighborhood] = offset + 1
+            st.rerun()
 
-    with st.container(border=True, key="places_card"):
-        section_label("Places nearby")
-        st.markdown("<div class='muted-text' style='margin-bottom:12px;'>Restaurants, bars, cafés, gyms, and bookstores that are still open.</div>", unsafe_allow_html=True)
-        if places_rows:
-            for _, name, address, _location in places_rows:
-                st.markdown(f"- **{name}** — {address}")
+    with st.container(border=True, key="going_card"):
+        section_label("Who else is going")
+        day_dates = {abbr: upcoming_date(abbr) for abbr in UPCOMING_DAYS}
+        chosen_day = st.pills(
+            "Pick a night",
+            options=UPCOMING_DAYS,
+            selection_mode="single",
+            key="night_pills",
+            label_visibility="collapsed",
+        )
+        if chosen_day:
+            night_str = day_dates[chosen_day].isoformat()
+            with pg().cursor() as c:
+                c.execute(
+                    "SELECT count(*) FROM attendances WHERE place_id = %s AND night = %s",
+                    (hero_id, night_str),
+                )
+                going_count = c.fetchone()[0]
+            st.markdown(
+                f"<div class='going-count'>{going_count} {'person' if going_count == 1 else 'people'} said "
+                f"they're going {chosen_day}.</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button("I'll be there", type="primary", key="im_going"):
+                with pg().cursor() as c:
+                    c.execute(
+                        "INSERT INTO attendances (place_id, place_name, night) VALUES (%s, %s, %s)",
+                        (hero_id, hero_name, night_str),
+                    )
+                st.rerun()
         else:
-            empty_state("We couldn't find any open places to gather in this area yet.")
+            st.markdown("<div class='muted-text'>Pick a night to see who's in.</div>", unsafe_allow_html=True)
 
     with st.container(border=True, key="invite_card"):
-        section_label("Invite a friend")
-
-        if places_rows:
-            place_labels = [f"{r[1]} — {r[2]}" for r in places_rows]
-            place_idx = st.selectbox("Pick a place", range(len(place_labels)), format_func=lambda i: place_labels[i])
-            chosen_id, chosen_name, chosen_addr, _chosen_location = places_rows[place_idx]
-            evening = st.date_input("Pick an evening")
-
+        section_label("Send this to a friend")
+        if not chosen_day:
+            st.markdown("<div class='muted-text'>Pick a night above first.</div>", unsafe_allow_html=True)
+        else:
             if "draft" not in st.session_state:
                 st.session_state.draft = ""
 
-            if st.button("Write an invite for me", type="primary"):
+            if st.button("Write the invite", type="primary", key="write_invite"):
                 api_key = secret("GEMINI_API_KEY")
                 prompt = (
                     f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
-                    f"to hang out at '{chosen_name}' ({chosen_addr}) in San Francisco on {evening.strftime('%A, %B %d')}. "
+                    f"to hang out at '{hero_name}' ({hero_addr}) in San Francisco this {chosen_day} "
+                    f"({day_dates[chosen_day].strftime('%B %d')}). "
                     f"Keep it warm and easygoing, no pressure to say yes, no exclamation-point overload. "
                     f"Just output the text message itself, nothing else."
                 )
@@ -291,26 +295,43 @@ def render_neighborhood(neighborhood, timings):
                     st.error("Something went wrong writing your invite. Please try again.")
 
             if st.session_state.draft:
-                st.write(st.session_state.draft)
+                st.code(st.session_state.draft, language=None)
 
-            if st.button("I'm going", type="primary"):
-                night_str = evening.isoformat()
-                with pg().cursor() as c:
-                    c.execute(
-                        "INSERT INTO attendances (place_id, place_name, night) VALUES (%s, %s, %s)",
-                        (chosen_id, chosen_name, night_str),
-                    )
-                    c.execute(
-                        "SELECT count(*) FROM attendances WHERE place_id = %s AND night = %s",
-                        (chosen_id, night_str),
-                    )
-                    same_count = c.fetchone()[0]
-                success_banner(
-                    f"You're going! {same_count} {'person has' if same_count == 1 else 'people have'} also picked "
-                    f"{chosen_name} on {evening.strftime('%A, %B %d')}."
-                )
+    place_count, count_ms = open_place_count(neighborhood)
+    timings.append(("counting places here", count_ms))
+    all_df, all_ms = citywide_gathering_counts()
+    timings.append(("comparing to the rest of the city", all_ms))
+    all_df["rank"] = range(1, len(all_df) + 1)
+    this_row = all_df[all_df["hood"] == neighborhood]
+
+    comparison = ""
+    if not this_row.empty and len(all_df) >= 3:
+        rank = int(this_row.iloc[0]["rank"])
+        pct = rank / len(all_df)
+        if pct <= 1 / 3:
+            comparison = "more than most of San Francisco"
+        elif pct <= 2 / 3:
+            comparison = "about the same as most of San Francisco"
         else:
-            empty_state("No open places to gather here yet, so there's nothing to invite a friend to.")
+            comparison = "fewer than most of San Francisco"
+    st.markdown(
+        f"<div class='muted-text' style='margin:16px 0;'>{place_count} places like this near you"
+        + (f", {comparison}." if comparison else ".") + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    map_points = []
+    for _, name, address, location, _naics, _start in places_rows:
+        m = POINT_RE.match(location) if location else None
+        if m:
+            lon, lat = float(m.group(1)), float(m.group(2))
+            map_points.append({"lat": lat, "lon": lon})
+        if len(map_points) >= 500:
+            break
+
+    if map_points:
+        with st.container(border=True, key="map_card"):
+            st.map(pd.DataFrame(map_points), size=20, color="#0070F3")
 
 
 st.markdown("""
@@ -367,18 +388,22 @@ h1, h2, h3, h4, p, label, span, div { color: #0A0A0A; }
     font-size: 16px;
     color: #666666;
 }
-.headline-number {
-    font-size: 56px;
+.hero-name {
+    font-size: 32px;
     font-weight: 700;
     color: #0A0A0A;
-    font-variant-numeric: tabular-nums;
-    line-height: 1.1;
+    line-height: 1.2;
     margin-bottom: 4px;
+}
+.going-count {
+    font-size: 20px;
+    font-weight: 600;
+    color: #0F9D58;
+    margin: 8px 0;
 }
 
 /* cards */
-.st-key-overview_card, .st-key-map_card, .st-key-stats_card,
-.st-key-chart_card, .st-key-places_card, .st-key-invite_card {
+.st-key-hero_card, .st-key-going_card, .st-key-invite_card, .st-key-map_card {
     background: #FFFFFF !important;
     border: 1px solid #EAEAEA !important;
     border-radius: 12px !important;
@@ -386,11 +411,6 @@ h1, h2, h3, h4, p, label, span, div { color: #0A0A0A; }
     margin-bottom: 20px !important;
     box-shadow: none !important;
 }
-
-/* stat metrics */
-[data-testid="stMetric"] { padding: 0 !important; background: transparent !important; border: none !important; }
-[data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; color: #0A0A0A; }
-[data-testid="stMetricLabel"] { color: #666666; }
 
 .empty-state {
     text-align: center;
@@ -409,8 +429,8 @@ h1, h2, h3, h4, p, label, span, div { color: #0A0A0A; }
     color: #0A0A0A;
 }
 
-/* neighborhood pills */
-.st-key-neighborhood_pills button {
+/* pills (neighborhood chips + night picker) */
+.st-key-neighborhood_pills button, .st-key-night_pills button {
     border-radius: 8px !important;
     padding: 8px 16px !important;
     font-size: 14px !important;
@@ -421,7 +441,10 @@ h1, h2, h3, h4, p, label, span, div { color: #0A0A0A; }
 }
 .st-key-neighborhood_pills button[aria-pressed="true"],
 .st-key-neighborhood_pills button[aria-checked="true"],
-.st-key-neighborhood_pills button[aria-selected="true"] {
+.st-key-neighborhood_pills button[aria-selected="true"],
+.st-key-night_pills button[aria-pressed="true"],
+.st-key-night_pills button[aria-checked="true"],
+.st-key-night_pills button[aria-selected="true"] {
     background-color: #0070F3 !important;
     color: #FFFFFF !important;
     border: none !important;
