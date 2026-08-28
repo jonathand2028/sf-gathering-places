@@ -129,6 +129,35 @@ def naics_filter_sql():
     return " OR ".join(f"startsWith(self_reported_naics_code, '{p}')" for p in GATHERING_NAICS_PREFIXES)
 
 
+COMMUNITY_KEYWORDS = (
+    "community center", "senior", "library", "ymca", "rec center", "recreation",
+    "neighborhood center", "cultural center", "club", "church", "temple",
+    "society", "association", "gallery", "studio", "collective",
+)
+FREE_KEYWORDS = (
+    "community center", "senior", "library", "ymca", "rec center", "recreation",
+    "neighborhood center", "church", "temple",
+)
+
+
+def is_community_institution(name):
+    lower = (name or "").lower()
+    return any(kw in lower for kw in COMMUNITY_KEYWORDS)
+
+
+def is_free_or_low_cost(name):
+    lower = (name or "").lower()
+    return any(kw in lower for kw in FREE_KEYWORDS)
+
+
+def community_filter_sql():
+    return " OR ".join(f"positionCaseInsensitive(dba_name, '{kw}') > 0" for kw in COMMUNITY_KEYWORDS)
+
+
+def place_filter_sql():
+    return f"(({naics_filter_sql()}) OR ({community_filter_sql()}))"
+
+
 @st.cache_data(ttl=600)
 def open_places(neighborhood):
     sql = f"""
@@ -138,7 +167,7 @@ def open_places(neighborhood):
         WHERE neighborhoods_analysis_boundaries = {{nb:String}}
           AND location_end_date = ''
           AND city = 'San Francisco'
-          AND ({naics_filter_sql()})
+          AND {place_filter_sql()}
         ORDER BY dba_name
     """
     t0 = time.time()
@@ -193,7 +222,7 @@ def top_chip_neighborhoods(n=8):
         WHERE hood != '' AND hood != 'Multiple'
           AND location_end_date = ''
           AND city = 'San Francisco'
-          AND ({naics_filter_sql()})
+          AND {place_filter_sql()}
     """
     t0 = time.time()
     try:
@@ -238,6 +267,12 @@ def category_label(naics):
     return "Gathering spot"
 
 
+def type_tag(name, naics):
+    if is_community_institution(name):
+        return "Community space"
+    return category_label(naics)
+
+
 JUNK_TOKENS = ("LLC", "INC", "CORP", "TRUST")
 
 
@@ -260,25 +295,46 @@ def empty_state(text):
     st.markdown(f"<div class='empty-state'>{text}</div>", unsafe_allow_html=True)
 
 
+FILTER_OPTIONS = ["Anywhere", "Free or low cost", "Community spaces"]
+
+
 def render_neighborhood(neighborhood):
     places_rows, places_ms = open_places(neighborhood)
     dismissed = fetch_dismissed_names()
     candidates = [p for p in places_rows if p[1] not in dismissed and not is_junk_name(p[1], p[2])]
 
+    category_filter = st.pills(
+        "Filter",
+        options=FILTER_OPTIONS,
+        selection_mode="single",
+        default="Anywhere",
+        key="category_filter",
+        label_visibility="collapsed",
+    ) or "Anywhere"
+
+    if category_filter == "Community spaces":
+        candidates = [p for p in candidates if is_community_institution(p[1])]
+    elif category_filter == "Free or low cost":
+        candidates = [p for p in candidates if is_free_or_low_cost(p[1])]
+
     if not candidates:
-        empty_state("No good matches here yet, try another neighborhood.")
+        if category_filter == "Community spaces":
+            empty_state("No community spaces found here yet, try Anywhere.")
+        elif category_filter == "Free or low cost":
+            empty_state("No free or low-cost spots found here yet, try Anywhere.")
+        else:
+            empty_state("No good matches here yet, try another neighborhood.")
         return None
 
     hero_id, hero_name, hero_addr, hero_naics, hero_start = candidates[0]
     record_shown(hero_name, neighborhood)
 
     with st.container(border=True, key="hero_card"):
+        st.markdown(f"<span class='type-tag'>{type_tag(hero_name, hero_naics)}</span>", unsafe_allow_html=True)
         st.markdown(f"<div class='hero-name'>{hero_name}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='muted-text'>{hero_addr}</div>", unsafe_allow_html=True)
-        meta_bits = [category_label(hero_naics)]
         if hero_start:
-            meta_bits.append(f"open since {hero_start[:4]}")
-        st.markdown(f"<div class='muted-text'>{' · '.join(meta_bits)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='muted-text'>open since {hero_start[:4]}</div>", unsafe_allow_html=True)
 
         col1, col2 = st.columns(2)
         if col1.button("Save this", type="primary", key="save_this"):
@@ -484,55 +540,75 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     margin-bottom: 10px;
 }
 
-/* pills (neighborhood chips) */
-.st-key-neighborhood_pills [data-testid="stButtonGroup"] {
+.type-tag {
+    display: inline-block;
+    background: rgba(59,130,246,0.12);
+    border: 1px solid rgba(59,130,246,0.35);
+    color: #93C5FD;
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+/* ============ unified control system ============ */
+/* base rule: everything clickable */
+.stButton>button,
+.st-key-neighborhood_pills button,
+.st-key-category_filter button {
+    cursor: pointer;
+    transition: all 0.15s ease;
+    border-radius: 10px;
+    font-weight: 500;
+}
+
+/* chips: neighborhoods + category filter */
+.st-key-neighborhood_pills [data-testid="stButtonGroup"],
+.st-key-category_filter [data-testid="stButtonGroup"] {
     display: flex !important;
     justify-content: center !important;
     flex-wrap: wrap !important;
     gap: 10px !important;
 }
-.st-key-neighborhood_pills button {
+.st-key-neighborhood_pills button,
+.st-key-category_filter button {
     border-radius: 999px !important;
     padding: 9px 18px !important;
     font-size: 14px !important;
     white-space: nowrap !important;
     width: auto !important;
-    border: 1px solid rgba(255,255,255,0.10) !important;
-    background-color: rgba(255,255,255,0.05) !important;
+    background: rgba(255,255,255,0.06) !important;
+    border: 1px solid rgba(255,255,255,0.14) !important;
     color: #CBD5E1 !important;
-    transition: all 0.15s ease !important;
-    cursor: pointer !important;
 }
-.st-key-neighborhood_pills button:hover {
+.st-key-neighborhood_pills button:hover,
+.st-key-category_filter button:hover {
+    background: rgba(255,255,255,0.11) !important;
+    border-color: rgba(255,255,255,0.30) !important;
+    color: #F1F5F9 !important;
     transform: translateY(-1px);
-    border-color: rgba(255,255,255,0.22) !important;
-    background-color: rgba(255,255,255,0.09) !important;
 }
-.st-key-neighborhood_pills button:active {
+.st-key-neighborhood_pills button:active,
+.st-key-category_filter button:active {
     transform: scale(0.985);
 }
 .st-key-neighborhood_pills button[aria-pressed="true"],
 .st-key-neighborhood_pills button[aria-checked="true"],
-.st-key-neighborhood_pills button[aria-selected="true"] {
+.st-key-neighborhood_pills button[aria-selected="true"],
+.st-key-category_filter button[aria-pressed="true"],
+.st-key-category_filter button[aria-checked="true"],
+.st-key-category_filter button[aria-selected="true"] {
     background-color: #3B82F6 !important;
     color: #FFFFFF !important;
     border: none !important;
     box-shadow: 0 0 24px rgba(59,130,246,0.45) !important;
 }
 
-/* buttons */
-.stButton>button {
-    border-radius: 10px;
-    transition: all 0.15s ease;
-    cursor: pointer;
-}
-.stButton>button:active {
-    transform: scale(0.985);
-}
+/* primary buttons: Save this, Write the invite */
 .stButton>button[kind="primary"] {
     background-color: #3B82F6;
     color: #FFFFFF;
-    border-radius: 10px;
     padding: 12px 26px;
     font-weight: 600;
     border: none;
@@ -543,23 +619,37 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     box-shadow: 0 0 28px rgba(59,130,246,0.5);
     transform: translateY(-1px);
 }
+.stButton>button[kind="primary"]:active {
+    transform: scale(0.985);
+}
+.stButton>button[kind="primary"]:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+/* secondary buttons: Not for me, Show me another, Remove */
 .stButton>button[kind="secondary"] {
-    background-color: rgba(255,255,255,0.05);
+    background: rgba(255,255,255,0.05);
     border: 1px solid rgba(255,255,255,0.14);
     color: #CBD5E1;
-    border-radius: 10px;
     padding: 11px 22px;
 }
 .stButton>button[kind="secondary"]:hover {
-    background-color: rgba(255,255,255,0.10);
+    background: rgba(255,255,255,0.10);
     border-color: rgba(255,255,255,0.28);
     color: #F1F5F9;
     transform: translateY(-1px);
 }
+.stButton>button[kind="secondary"]:active {
+    transform: scale(0.985);
+}
 
-/* keyboard focus */
+/* keyboard focus ring, everything clickable */
 .stButton>button:focus-visible,
 .st-key-neighborhood_pills button:focus-visible,
+.st-key-category_filter button:focus-visible,
 [data-testid="stTextInput"] input:focus-visible,
 [data-testid="stSelectbox"] div[data-baseweb="select"] > div:focus-within {
     outline: 2px solid #3B82F6 !important;
@@ -571,17 +661,24 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     transition: all 0.15s ease;
 }
 .st-key-hero_card:hover {
-    border-color: rgba(255,255,255,0.16) !important;
-    transform: translateY(-1px);
+    border-color: rgba(255,255,255,0.18) !important;
+    transform: translateY(-2px);
 }
 
 /* inputs and dropdown */
 [data-testid="stTextInput"] input,
 [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
     background-color: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(255,255,255,0.10) !important;
+    border: 1px solid rgba(255,255,255,0.12) !important;
     border-radius: 10px !important;
     color: #F1F5F9 !important;
+    transition: all 0.15s ease !important;
+}
+[data-testid="stTextInput"] input:hover,
+[data-testid="stTextInput"] input:focus,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div:hover,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div:focus-within {
+    border-color: #3B82F6 !important;
 }
 </style>
 """, unsafe_allow_html=True)
