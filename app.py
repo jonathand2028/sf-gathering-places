@@ -1,4 +1,4 @@
-import os, time, datetime
+import os, time
 import requests
 import streamlit as st
 import clickhouse_connect, certifi, psycopg2
@@ -20,9 +20,6 @@ NEIGHBORHOOD_CHIPS = [
 ]
 CHIP_LABELS = [label for label, _ in NEIGHBORHOOD_CHIPS]
 HOOD_BY_LABEL = dict(NEIGHBORHOOD_CHIPS)
-
-UPCOMING_DAYS = ["Tue", "Wed", "Thu", "Fri", "Sat"]
-WEEKDAY_INDEX = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
 
 def secret(key):
@@ -48,11 +45,18 @@ def pg():
     conn.autocommit = True
     with conn.cursor() as c:
         c.execute("""
-            CREATE TABLE IF NOT EXISTS attendances (
+            CREATE TABLE IF NOT EXISTS saved_places (
                 id SERIAL PRIMARY KEY,
-                place_id TEXT,
                 place_name TEXT,
-                night TEXT,
+                address TEXT,
+                neighborhood TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS dismissed_places (
+                id SERIAL PRIMARY KEY,
+                place_name TEXT,
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         """)
@@ -87,17 +91,16 @@ def total_business_count():
     return r.result_rows[0][0], ms
 
 
-def fetch_rsvp_counts():
+def fetch_dismissed_names():
     with pg().cursor() as c:
-        c.execute("SELECT place_id, count(*) FROM attendances GROUP BY place_id")
-        return dict(c.fetchall())
+        c.execute("SELECT place_name FROM dismissed_places")
+        return {row[0] for row in c.fetchall()}
 
 
-def build_place_order(places_rows, rsvp_counts):
-    with_rsvp = [i for i, p in enumerate(places_rows) if rsvp_counts.get(p[0], 0) > 0]
-    with_rsvp.sort(key=lambda i: -rsvp_counts.get(places_rows[i][0], 0))
-    without_rsvp = [i for i in range(len(places_rows)) if i not in with_rsvp]
-    return with_rsvp + without_rsvp
+def fetch_saved_places():
+    with pg().cursor() as c:
+        c.execute("SELECT id, place_name, address, neighborhood FROM saved_places ORDER BY created_at DESC")
+        return c.fetchall()
 
 
 def category_label(naics):
@@ -112,12 +115,6 @@ def category_label(naics):
     return "Gathering spot"
 
 
-def upcoming_date(day_abbr):
-    today = datetime.date.today()
-    delta = (WEEKDAY_INDEX[day_abbr] - today.weekday()) % 7
-    return today + datetime.timedelta(days=delta)
-
-
 def section_label(text):
     st.markdown(f"<div class='section-label'>{text}</div>", unsafe_allow_html=True)
 
@@ -128,20 +125,14 @@ def empty_state(text):
 
 def render_neighborhood(neighborhood):
     places_rows, _places_ms = open_places(neighborhood)
+    dismissed = fetch_dismissed_names()
+    candidates = [p for p in places_rows if p[1] not in dismissed]
 
-    if not places_rows:
+    if not candidates:
         empty_state("No open places to gather here yet. Try another neighborhood.")
         return
 
-    rsvp_counts = fetch_rsvp_counts()
-    order = build_place_order(places_rows, rsvp_counts)
-
-    if "hero_offset" not in st.session_state:
-        st.session_state.hero_offset = {}
-    offset = st.session_state.hero_offset.get(neighborhood, 0)
-    hero_idx = order[offset % len(order)]
-    hero_place = places_rows[hero_idx]
-    hero_id, hero_name, hero_addr, hero_naics, hero_start = hero_place
+    hero_id, hero_name, hero_addr, hero_naics, hero_start = candidates[0]
 
     with st.container(border=True, key="hero_card"):
         st.markdown(f"<div class='hero-name'>{hero_name}</div>", unsafe_allow_html=True)
@@ -150,78 +141,65 @@ def render_neighborhood(neighborhood):
         if hero_start:
             meta_bits.append(f"open since {hero_start[:4]}")
         st.markdown(f"<div class='muted-text'>{' · '.join(meta_bits)}</div>", unsafe_allow_html=True)
-        if st.button("Show me another", key="show_another"):
-            st.session_state.hero_offset[neighborhood] = offset + 1
-            st.rerun()
 
-    with st.container(border=True, key="going_card"):
-        section_label("Who's going")
-        day_dates = {abbr: upcoming_date(abbr) for abbr in UPCOMING_DAYS}
-        chosen_day = st.pills(
-            "Pick a night",
-            options=UPCOMING_DAYS,
-            selection_mode="single",
-            key="night_pills",
-            label_visibility="collapsed",
-        )
-        if chosen_day:
-            night_str = day_dates[chosen_day].isoformat()
+        col1, col2 = st.columns(2)
+        if col1.button("Save this", type="primary", key="save_this"):
             with pg().cursor() as c:
                 c.execute(
-                    "SELECT count(*) FROM attendances WHERE place_id = %s AND night = %s",
-                    (hero_id, night_str),
+                    "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)",
+                    (hero_name, hero_addr, neighborhood),
                 )
-                going_count = c.fetchone()[0]
-            st.markdown(
-                f"<div class='going-count'>{going_count} {'person is' if going_count == 1 else 'people are'} "
-                f"going {chosen_day}.</div>",
-                unsafe_allow_html=True,
-            )
-            if st.button("I'll be there", type="primary", key="im_going"):
-                with pg().cursor() as c:
-                    c.execute(
-                        "INSERT INTO attendances (place_id, place_name, night) VALUES (%s, %s, %s)",
-                        (hero_id, hero_name, night_str),
-                    )
-                st.rerun()
-        else:
-            st.markdown("<div class='muted-text'>Pick a night to see who's in.</div>", unsafe_allow_html=True)
+        if col2.button("Not for me", key="not_for_me"):
+            with pg().cursor() as c:
+                c.execute("INSERT INTO dismissed_places (place_name) VALUES (%s)", (hero_name,))
+            st.rerun()
 
     with st.container(border=True, key="invite_card"):
         section_label("Send this to a friend")
-        if not chosen_day:
-            st.markdown("<div class='muted-text'>Pick a night above first.</div>", unsafe_allow_html=True)
-        else:
-            if "draft" not in st.session_state:
-                st.session_state.draft = ""
+        if "draft" not in st.session_state:
+            st.session_state.draft = ""
 
-            if st.button("Write the invite", type="primary", key="write_invite"):
-                api_key = secret("GEMINI_API_KEY")
-                prompt = (
-                    f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
-                    f"to hang out at '{hero_name}' ({hero_addr}) in San Francisco this {chosen_day} "
-                    f"({day_dates[chosen_day].strftime('%B %d')}). "
-                    f"Keep it warm and easygoing, no pressure to say yes, no exclamation-point overload. "
-                    f"Just output the text message itself, nothing else."
+        if st.button("Write the invite", type="primary", key="write_invite"):
+            api_key = secret("GEMINI_API_KEY")
+            prompt = (
+                f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
+                f"to hang out at '{hero_name}' ({hero_addr}) in San Francisco. "
+                f"Keep it warm and easygoing, no pressure to say yes, no exclamation-point overload. "
+                f"Just output the text message itself, nothing else."
+            )
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-flash-lite-latest:generateContent?key={api_key}"
+            )
+            try:
+                resp = requests.post(
+                    url,
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                    timeout=30,
                 )
-                url = (
-                    "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-flash-lite-latest:generateContent?key={api_key}"
-                )
-                try:
-                    resp = requests.post(
-                        url,
-                        json={"contents": [{"parts": [{"text": prompt}]}]},
-                        timeout=30,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    st.session_state.draft = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                except Exception:
-                    st.error("Something went wrong writing your invite. Please try again.")
+                resp.raise_for_status()
+                data = resp.json()
+                st.session_state.draft = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except Exception:
+                st.error("Something went wrong writing your invite. Please try again.")
 
-            if st.session_state.draft:
-                st.code(st.session_state.draft, language=None)
+        if st.session_state.draft:
+            st.code(st.session_state.draft, language=None)
+
+
+def render_saved_places():
+    saved = fetch_saved_places()
+    if not saved:
+        return
+    section_label("Your list")
+    for saved_id, place_name, address, neighborhood in saved:
+        with st.container(border=True):
+            col1, col2 = st.columns([5, 1])
+            col1.markdown(f"**{place_name}** — {address} ({neighborhood})")
+            if col2.button("Remove", key=f"remove_{saved_id}"):
+                with pg().cursor() as c:
+                    c.execute("DELETE FROM saved_places WHERE id = %s", (saved_id,))
+                st.rerun()
 
 
 st.markdown("""
@@ -284,12 +262,6 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
     line-height: 1.2;
     margin-bottom: 4px;
 }
-.going-count {
-    font-size: 20px;
-    font-weight: 600;
-    color: #3DD68C;
-    margin: 8px 0;
-}
 .footer-note {
     font-size: 13px;
     color: #8B95A5;
@@ -297,7 +269,7 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
 }
 
 /* cards */
-.st-key-hero_card, .st-key-going_card, .st-key-invite_card {
+.st-key-hero_card, .st-key-invite_card {
     background: #171B22 !important;
     border: 1px solid #242A33 !important;
     border-radius: 14px !important;
@@ -318,8 +290,8 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
     background: #171B22;
 }
 
-/* pills (neighborhood chips + night picker) */
-.st-key-neighborhood_pills button, .st-key-night_pills button {
+/* pills (neighborhood chips) */
+.st-key-neighborhood_pills button {
     border-radius: 8px !important;
     padding: 8px 16px !important;
     font-size: 14px !important;
@@ -330,10 +302,7 @@ h1, h2, h3, h4, p, label, span, div { color: #F2F4F7; }
 }
 .st-key-neighborhood_pills button[aria-pressed="true"],
 .st-key-neighborhood_pills button[aria-checked="true"],
-.st-key-neighborhood_pills button[aria-selected="true"],
-.st-key-night_pills button[aria-pressed="true"],
-.st-key-night_pills button[aria-checked="true"],
-.st-key-night_pills button[aria-selected="true"] {
+.st-key-neighborhood_pills button[aria-selected="true"] {
     background-color: #FF6B4A !important;
     color: #0E1116 !important;
     border: none !important;
@@ -382,6 +351,7 @@ if not neighborhood:
 
 try:
     render_neighborhood(neighborhood)
+    render_saved_places()
 except Exception:
     st.error("We're having trouble reaching our data right now. Please try again in a moment.")
 
