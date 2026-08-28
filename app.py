@@ -38,6 +38,18 @@ def secret(key):
     return os.getenv(key)
 
 
+def gemini_generate(prompt):
+    api_key = secret("GEMINI_API_KEY")
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-flash-lite-latest:generateContent?key={api_key}"
+    )
+    resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
 @st.cache_resource
 def ch():
     return clickhouse_connect.get_client(
@@ -129,20 +141,23 @@ def naics_filter_sql():
     return " OR ".join(f"startsWith(self_reported_naics_code, '{p}')" for p in GATHERING_NAICS_PREFIXES)
 
 
-COMMUNITY_KEYWORDS = (
-    "community center", "senior", "library", "ymca", "rec center", "recreation",
-    "neighborhood center", "cultural center", "club", "church", "temple",
-    "society", "association", "gallery", "studio", "collective",
+ALONE_FRIENDLY_KEYWORDS = (
+    "community center", "senior center", "library", "ymca", "rec center",
+    "recreation center", "gym", "fitness", "yoga", "pilates", "crossfit",
+    "martial arts", "jiu jitsu", "boxing", "dance", "climbing", "bouldering",
+    "church", "temple", "synagogue", "meditation", "zen", "art center",
+    "cultural center", "makerspace", "workshop", "chess", "run club",
+    "bowling", "pottery", "ceramics",
 )
 FREE_KEYWORDS = (
-    "community center", "senior", "library", "ymca", "rec center", "recreation",
-    "neighborhood center", "church", "temple",
+    "community center", "senior center", "library", "ymca", "rec center",
+    "recreation center", "church", "temple", "synagogue",
 )
 
 
-def is_community_institution(name):
+def is_alone_friendly(name):
     lower = (name or "").lower()
-    return any(kw in lower for kw in COMMUNITY_KEYWORDS)
+    return any(kw in lower for kw in ALONE_FRIENDLY_KEYWORDS)
 
 
 def is_free_or_low_cost(name):
@@ -150,12 +165,12 @@ def is_free_or_low_cost(name):
     return any(kw in lower for kw in FREE_KEYWORDS)
 
 
-def community_filter_sql():
-    return " OR ".join(f"positionCaseInsensitive(dba_name, '{kw}') > 0" for kw in COMMUNITY_KEYWORDS)
+def alone_friendly_filter_sql():
+    return " OR ".join(f"positionCaseInsensitive(dba_name, '{kw}') > 0" for kw in ALONE_FRIENDLY_KEYWORDS)
 
 
 def place_filter_sql():
-    return f"(({naics_filter_sql()}) OR ({community_filter_sql()}))"
+    return f"(({naics_filter_sql()}) OR ({alone_friendly_filter_sql()}))"
 
 
 @st.cache_data(ttl=600)
@@ -232,12 +247,14 @@ def top_chip_neighborhoods(n=8):
         raise
     ms = int((time.time() - t0) * 1000)
     counts = {}
+    total = 0
     for hood, name, addr in r.result_rows:
         if is_junk_name(name, addr):
             continue
         counts[hood] = counts.get(hood, 0) + 1
+        total += 1
     ranked = sorted(counts.items(), key=lambda kv: -kv[1])
-    return [hood for hood, _ in ranked[:n]], ms
+    return [hood for hood, _ in ranked[:n]], total, ms
 
 
 def fetch_dismissed_names():
@@ -268,7 +285,7 @@ def category_label(naics):
 
 
 def type_tag(name, naics):
-    if is_community_institution(name):
+    if is_alone_friendly(name):
         return "Community space"
     return category_label(naics)
 
@@ -295,7 +312,7 @@ def empty_state(text):
     st.markdown(f"<div class='empty-state'>{text}</div>", unsafe_allow_html=True)
 
 
-FILTER_OPTIONS = ["Anywhere", "Free or low cost", "Community spaces"]
+FILTER_OPTIONS = ["Show up alone", "Free or low cost", "Anywhere"]
 
 
 def render_neighborhood(neighborhood):
@@ -307,19 +324,19 @@ def render_neighborhood(neighborhood):
         "Filter",
         options=FILTER_OPTIONS,
         selection_mode="single",
-        default="Anywhere",
+        default="Show up alone",
         key="category_filter",
         label_visibility="collapsed",
-    ) or "Anywhere"
+    ) or "Show up alone"
 
-    if category_filter == "Community spaces":
-        candidates = [p for p in candidates if is_community_institution(p[1])]
+    if category_filter == "Show up alone":
+        candidates = [p for p in candidates if is_alone_friendly(p[1])]
     elif category_filter == "Free or low cost":
         candidates = [p for p in candidates if is_free_or_low_cost(p[1])]
 
     if not candidates:
-        if category_filter == "Community spaces":
-            empty_state("No community spaces found here yet, try Anywhere.")
+        if category_filter == "Show up alone":
+            empty_state("Nothing for showing up alone found here yet, try Anywhere.")
         elif category_filter == "Free or low cost":
             empty_state("No free or low-cost spots found here yet, try Anywhere.")
         else:
@@ -358,42 +375,65 @@ def render_neighborhood(neighborhood):
         unsafe_allow_html=True,
     )
 
-    with st.container(border=True, key="invite_card"):
-        section_label("Send this to a friend")
-        if "draft" not in st.session_state:
-            st.session_state.draft = ""
-        if "writing_invite" not in st.session_state:
-            st.session_state.writing_invite = False
+    kind = type_tag(hero_name, hero_naics).lower()
+    open_since_text = f"open since {hero_start[:4]}" if hero_start else None
 
-        if st.button("Write the invite", type="primary", key="write_invite", disabled=st.session_state.writing_invite):
-            st.session_state.writing_invite = True
-            with st.spinner("Writing your invite…"):
-                api_key = secret("GEMINI_API_KEY")
+    with st.container(border=True, key="invite_card"):
+        section_label("Going there")
+        for key in ("solo_draft", "invite_drafts", "writing_solo", "writing_invite"):
+            if key not in st.session_state:
+                st.session_state[key] = "" if key == "solo_draft" else ([] if key == "invite_drafts" else False)
+
+        if st.button(
+            "What's it like to go alone?", type="primary", key="solo_button",
+            disabled=st.session_state.writing_solo,
+        ):
+            st.session_state.writing_solo = True
+            with st.spinner("Thinking it through…"):
                 prompt = (
-                    f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
-                    f"to hang out at '{hero_name}' ({hero_addr}) in San Francisco. "
-                    f"Keep it warm and easygoing, no pressure to say yes, no exclamation-point overload. "
-                    f"Just output the text message itself, nothing else."
-                )
-                url = (
-                    "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-flash-lite-latest:generateContent?key={api_key}"
+                    f"Someone is thinking about going alone to {hero_name}, a {kind} in {neighborhood}, "
+                    f"San Francisco" + (f", {open_since_text}" if open_since_text else "") + ". "
+                    f"Write 3 to 4 short, practical sentences about what it's actually like to show up there by "
+                    f"yourself: a good time to go, anything to bring, what to say to whoever's at the front desk "
+                    f"or counter, and honest reassurance that going alone there is normal. "
+                    f"Tone: practical and warm, like a friend explaining it, not a motivational poster. "
+                    f"No exclamation marks. Output only those sentences, nothing else."
                 )
                 try:
-                    resp = requests.post(
-                        url,
-                        json={"contents": [{"parts": [{"text": prompt}]}]},
-                        timeout=30,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    st.session_state.draft = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    st.session_state.solo_draft = gemini_generate(prompt)
+                except Exception:
+                    st.error("Something went wrong putting that together. Please try again.")
+            st.session_state.writing_solo = False
+
+        if st.session_state.solo_draft:
+            st.code(st.session_state.solo_draft, language=None)
+
+        if st.button(
+            "Invite someone", key="invite_button",
+            disabled=st.session_state.writing_invite,
+        ):
+            st.session_state.writing_invite = True
+            with st.spinner("Writing your invite…"):
+                prompt = (
+                    f"Write two different short text messages inviting a friend to {hero_name}, a {kind} "
+                    f"in {neighborhood}, San Francisco" + (f" ({open_since_text})" if open_since_text else "") + ". "
+                    f"Each must sound like an actual text a real person would send a friend, not an invitation "
+                    f"or a flyer. Rules: lowercase and casual, 2-3 sentences max, no exclamation marks, no "
+                    f"\"hey there\" or similar greetings, no marketing language, include one concrete suggestion "
+                    f"of when (like \"this weekend\" or \"friday after work\"). "
+                    f"Separate the two messages with a line containing only ---. "
+                    f"Output only the two messages and the separator, nothing else."
+                )
+                try:
+                    text = gemini_generate(prompt)
+                    parts = [p.strip() for p in text.split("---") if p.strip()]
+                    st.session_state.invite_drafts = parts[:2]
                 except Exception:
                     st.error("Something went wrong writing your invite. Please try again.")
             st.session_state.writing_invite = False
 
-        if st.session_state.draft:
-            st.code(st.session_state.draft, language=None)
+        for draft in st.session_state.invite_drafts:
+            st.code(draft, language=None)
 
     saved = fetch_saved_places()
     if saved:
@@ -684,14 +724,15 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
 """, unsafe_allow_html=True)
 
 try:
-    badge_count, _badge_ms = total_business_count()
-    badge_text = f"San Francisco · {badge_count:,} places"
+    chip_hoods, gathering_total, _chip_ms = top_chip_neighborhoods()
+    badge_text = f"San Francisco · {gathering_total:,} places to gather"
 except Exception:
+    chip_hoods = []
     badge_text = "San Francisco"
 
 st.markdown(f"<div class='hero-badge'>{badge_text}</div>", unsafe_allow_html=True)
 st.markdown("<div class='page-title'>SF Gathering Places</div>", unsafe_allow_html=True)
-st.markdown("<div class='page-subtitle'>Find one place near you, and someone to go with.</div>", unsafe_allow_html=True)
+st.markdown("<div class='page-subtitle'>Places you can walk into alone, where you'll end up around people.</div>", unsafe_allow_html=True)
 
 if "neighborhood" not in st.session_state:
     st.session_state.neighborhood = None
@@ -736,11 +777,6 @@ elif cur_zip != st.session_state.prev_zip and cur_zip:
 st.session_state.prev_pills = cur_pills
 st.session_state.prev_dropdown = cur_dropdown
 st.session_state.prev_zip = cur_zip
-
-try:
-    chip_hoods, _chip_ms = top_chip_neighborhoods()
-except Exception:
-    chip_hoods = []
 
 if chip_hoods:
     st.markdown("<div class='chip-caption'>The neighborhoods with the most places to gather</div>", unsafe_allow_html=True)
