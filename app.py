@@ -252,13 +252,20 @@ def total_business_count():
     return r.result_rows[0][0], ms
 
 
+BAY_AREA_VIEWBOX = "-122.6,37.9,-122.2,37.6"  # left,top,right,bottom: covers SF, Oakland, Berkeley, the Peninsula
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode(query):
-    """Returns (lat, lon, display_name) or None."""
+    """Returns (lat, lon, display_name) or None. Biased to the Bay Area but not
+    limited to San Francisco -- Oakland/Berkeley/Peninsula addresses still resolve."""
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "json", "limit": 1, "countrycodes": "us"},
+            params={
+                "q": query, "format": "json", "limit": 1, "countrycodes": "us",
+                "viewbox": BAY_AREA_VIEWBOX, "bounded": 1,
+            },
             headers={"User-Agent": "SFGatheringPlaces/1.0 (hackathon project)"},
             timeout=6,
         )
@@ -279,7 +286,7 @@ STREET_ABBREV = {
 DROP_ADDRESS_SUFFIXES = ("united states", "usa", "us", "california", "ca")
 
 
-def format_clean_address(raw_str):
+def clean_address_display(raw_str):
     """Cleans raw geocoder output: drops county/country/state noise, abbreviates
     street suffixes, and joins a leading house number with its street name."""
     if not raw_str:
@@ -483,6 +490,31 @@ def render_generated_text(text):
     st.markdown(f"<div class='generated-text'>{html.escape(text)}</div>", unsafe_allow_html=True)
 
 
+def render_fallback_tip(text):
+    st.markdown(f"<div class='fallback-box'>{html.escape(text)}</div>", unsafe_allow_html=True)
+
+
+SOLO_FALLBACK_TIPS = {
+    "Bar": "Dropping in alone? Grab a seat at the bar itself rather than a table — bartenders and regulars are used to solo visitors there, and it's the easiest place to strike up a conversation.",
+    "Restaurant or café": "Dropping in alone? Ask for counter or bar seating if it's available — it's completely normal, and staff won't blink at a party of one.",
+    "Gym or fitness studio": "Dropping in alone? Head to the front desk, mention it's your first time, and they'll get you oriented. Everyone's focused on their own workout, not on who came with whom.",
+    "Bookstore": "Dropping in alone? Just browse — bookstores are built for solo visits, and staff are happy to point you toward a section if you ask.",
+    "Community space": "Dropping in alone? Head straight to the front desk or main gathering area. Staff and regulars at community spaces are used to welcoming newcomers.",
+    "Gathering spot": "Dropping in alone? Head straight to the counter or main seating area. Staff and regulars are welcoming to newcomers.",
+}
+
+
+def solo_fallback_tip(kind_label):
+    return SOLO_FALLBACK_TIPS.get(kind_label, SOLO_FALLBACK_TIPS["Gathering spot"])
+
+
+def invite_fallback_text(hero_name, hero_hood):
+    return (
+        f"hey, want to check out {hero_name} in {hero_hood} sometime this week? "
+        f"no pressure, just thought of you."
+    )
+
+
 FILTER_OPTIONS = ["Show up alone", "Free or low cost", "Anywhere"]
 
 
@@ -491,7 +523,7 @@ OUT_OF_SF_MILES = 1.0
 
 def render_body(neighborhood=None, anchor=None):
     if anchor:
-        st.markdown(f"<div class='muted-text' style='margin-bottom:12px;'>Found: {format_clean_address(anchor['label'])}.</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='muted-text' style='margin-bottom:12px;'>Found: {clean_address_display(anchor['label'])}.</div>", unsafe_allow_html=True)
         raw_rows, fetch_ms = places_near_anchor(anchor["lat"], anchor["lon"])
         rows = [
             {"id": r[0], "name": r[1], "addr": r[2], "naics": r[3], "start": r[4], "dist_m": r[5], "hood": r[6]}
@@ -542,12 +574,16 @@ def render_body(neighborhood=None, anchor=None):
     if st.session_state.get("last_hero_id") != hero_id:
         st.session_state.last_hero_id = hero_id
         st.session_state.solo_draft = ""
+        st.session_state.solo_is_fallback = False
         st.session_state.invite_drafts = []
+        st.session_state.invite_is_fallback = False
 
     if anchor and hero["dist_m"] is not None and hero["dist_m"] / 1609.34 > OUT_OF_SF_MILES:
+        origin_miles = hero["dist_m"] / 1609.34
+        origin_label = clean_address_display(anchor["label"])
         st.markdown(
-            f"<div class='muted-text' style='margin-bottom:12px;'>You're about "
-            f"{hero['dist_m'] / 1609.34:.1f} miles from the nearest place we cover — other cities coming soon.</div>",
+            f"<div class='muted-text' style='margin-bottom:12px;'>{origin_miles:.1f} miles away from "
+            f"{origin_label} — here are the closest places we cover. Other cities coming soon.</div>",
             unsafe_allow_html=True,
         )
 
@@ -579,7 +615,9 @@ def render_body(neighborhood=None, anchor=None):
             except Exception:
                 st.warning("Couldn't update that just now. Please try again.")
             st.session_state.solo_draft = ""
+            st.session_state.solo_is_fallback = False
             st.session_state.invite_drafts = []
+            st.session_state.invite_is_fallback = False
             st.session_state.writing_solo = False
             st.session_state.writing_invite = False
             st.rerun()
@@ -602,7 +640,10 @@ def render_body(neighborhood=None, anchor=None):
 
     with st.container(border=True, key="invite_card"):
         section_label("Going there")
-        for key in ("solo_draft", "invite_drafts", "writing_solo", "writing_invite"):
+        for key in (
+            "solo_draft", "invite_drafts", "writing_solo", "writing_invite",
+            "solo_is_fallback", "invite_is_fallback",
+        ):
             if key not in st.session_state:
                 st.session_state[key] = "" if key == "solo_draft" else ([] if key == "invite_drafts" else False)
 
@@ -623,12 +664,18 @@ def render_body(neighborhood=None, anchor=None):
                 )
                 try:
                     st.session_state.solo_draft = gemini_generate(prompt)
-                except Exception:
-                    st.error("Something went wrong putting that together. Please try again.")
+                    st.session_state.solo_is_fallback = False
+                except Exception as e:
+                    record_error("gemini_generate (solo)", e)
+                    st.session_state.solo_draft = solo_fallback_tip(type_tag(hero_name, hero_naics))
+                    st.session_state.solo_is_fallback = True
             st.session_state.writing_solo = False
 
         if st.session_state.solo_draft:
-            render_generated_text(st.session_state.solo_draft)
+            if st.session_state.get("solo_is_fallback"):
+                render_fallback_tip(st.session_state.solo_draft)
+            else:
+                render_generated_text(st.session_state.solo_draft)
 
         if st.button(
             "Invite someone", type="primary", key="invite_button",
@@ -650,12 +697,18 @@ def render_body(neighborhood=None, anchor=None):
                     text = gemini_generate(prompt)
                     parts = [p.strip() for p in text.split("---") if p.strip()]
                     st.session_state.invite_drafts = parts[:2]
-                except Exception:
-                    st.error("Something went wrong writing your invite. Please try again.")
+                    st.session_state.invite_is_fallback = False
+                except Exception as e:
+                    record_error("gemini_generate (invite)", e)
+                    st.session_state.invite_drafts = [invite_fallback_text(hero_name, hero_hood)]
+                    st.session_state.invite_is_fallback = True
             st.session_state.writing_invite = False
 
         for draft in st.session_state.invite_drafts:
-            render_generated_text(draft)
+            if st.session_state.get("invite_is_fallback"):
+                render_fallback_tip(draft)
+            else:
+                render_generated_text(draft)
 
     saved = fetch_saved_places()
     if saved:
@@ -836,6 +889,21 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     margin-bottom: 12px;
 }
 
+.fallback-box {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(234,179,8,0.35);
+    border-left: 3px solid rgba(234,179,8,0.6);
+    border-radius: 10px;
+    padding: 16px 18px;
+    color: #F1F5F9;
+    font-size: 15px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    margin-bottom: 12px;
+}
+
 .ch-badge {
     font-size: 12px;
     color: #94A3B8;
@@ -895,13 +963,22 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     box-shadow: 0 0 24px rgba(59,130,246,0.45) !important;
 }
 
-/* primary buttons: Save this, Write the invite */
+/* all venue-card buttons share identical box dimensions; only color/border differ */
+.stButton>button[kind="primary"],
+.stButton>button[kind="secondary"] {
+    padding: 12px 26px;
+    font-size: 15px;
+    border-radius: 10px;
+    font-weight: 600;
+    border-width: 1px;
+    border-style: solid;
+}
+
+/* primary buttons: Save this, What's it like to go alone?, Invite someone */
 .stButton>button[kind="primary"] {
     background-color: #3B82F6;
     color: #FFFFFF;
-    padding: 12px 26px;
-    font-weight: 600;
-    border: none;
+    border-color: transparent;
 }
 .stButton>button[kind="primary"]:hover {
     background-color: #2563EB;
@@ -919,12 +996,11 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     box-shadow: none;
 }
 
-/* secondary buttons: Not for me, Show me another, Remove */
+/* secondary button: Not for me -- dark-glass, same footprint as the primaries */
 .stButton>button[kind="secondary"] {
     background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.14);
+    border-color: rgba(255,255,255,0.14);
     color: #CBD5E1;
-    padding: 11px 22px;
 }
 .stButton>button[kind="secondary"]:hover {
     background: rgba(255,255,255,0.10);
@@ -1052,7 +1128,7 @@ elif cur_search != st.session_state.prev_search and cur_search:
             result = geocode(f"{cleaned}, CA, USA")
             if result:
                 lat, lon, display = result
-                st.session_state.anchor = {"lat": lat, "lon": lon, "label": format_clean_address(display)}
+                st.session_state.anchor = {"lat": lat, "lon": lon, "label": clean_address_display(display)}
                 st.session_state.neighborhood = None
                 st.session_state.neighborhood_pills = None
                 st.session_state.neighborhood_dropdown = None
@@ -1081,7 +1157,7 @@ elif cur_search != st.session_state.prev_search and cur_search:
                 result = geocode(cleaned)
                 if result:
                     lat, lon, display = result
-                    st.session_state.anchor = {"lat": lat, "lon": lon, "label": format_clean_address(display)}
+                    st.session_state.anchor = {"lat": lat, "lon": lon, "label": clean_address_display(display)}
                     st.session_state.neighborhood = None
                     st.session_state.neighborhood_pills = None
                     st.session_state.neighborhood_dropdown = None
