@@ -1,0 +1,7 @@
+streamlit
+clickhouse-connect
+psycopg2-binary
+python-dotenv
+certifi
+requests
+pandas

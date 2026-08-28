@@ -1,4 +1,4 @@
-import os, time, json
+import os, time
 import requests
 import streamlit as st
 import pandas as pd
@@ -6,23 +6,31 @@ import clickhouse_connect, certifi, psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
-st.set_page_config(page_title="SF Gathering Places", layout="wide")
+st.set_page_config(page_title="SF Gathering Places", layout="centered")
 
 GATHERING_NAICS_PREFIXES = ("7225", "7224", "7139", "4512", "4592")
-GATHERING_LABEL = "restaurants, bars, cafes, gyms, and bookstores"
+
+
+def secret(key):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key)
 
 
 @st.cache_resource
 def ch():
     return clickhouse_connect.get_client(
-        host=os.getenv("CH_HOST"), port=8443, username="default",
-        password=os.getenv("CH_PASSWORD"), secure=True, ca_cert=certifi.where(),
+        host=secret("CH_HOST"), port=8443, username="default",
+        password=secret("CH_PASSWORD"), secure=True, ca_cert=certifi.where(),
     )
 
 
 @st.cache_resource
 def pg():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    conn = psycopg2.connect(secret("DATABASE_URL"))
     conn.autocommit = True
     with conn.cursor() as c:
         c.execute("""
@@ -31,14 +39,6 @@ def pg():
                 place_id TEXT,
                 place_name TEXT,
                 night TEXT,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS saved_neighborhoods (
-                id SERIAL PRIMARY KEY,
-                hood TEXT,
-                note TEXT,
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         """)
@@ -56,89 +56,77 @@ def naics_filter_sql():
     return " OR ".join(f"startsWith(self_reported_naics_code, '{p}')" for p in GATHERING_NAICS_PREFIXES)
 
 
+timings = []
+
 st.title("SF Gathering Places")
-st.caption("Find a still-open neighborhood spot and invite a friend.")
+st.write("Find a spot near you and invite a friend to meet up.")
 
-# ---------- sidebar: saved neighborhoods + table counts ----------
-with pg().cursor() as c:
-    c.execute("SELECT count(*) FROM attendances")
-    attendance_count = c.fetchone()[0]
-    c.execute("SELECT count(*) FROM saved_neighborhoods")
-    saved_count = c.fetchone()[0]
-    c.execute("SELECT hood, note, created_at FROM saved_neighborhoods ORDER BY created_at DESC")
-    saved_rows = c.fetchall()
+zip_code = st.text_input("Your zip code", placeholder="94115").strip()
 
-with st.sidebar:
-    st.header("Saved neighborhoods")
-    st.caption(f"{saved_count} saved · {attendance_count} RSVPs")
-    if saved_rows:
-        for hood, note, created_at in saved_rows:
-            st.markdown(f"**{hood}**")
-            st.caption(note if note else "_no note_")
-    else:
-        st.caption("Nothing saved yet.")
+if not zip_code:
+    st.info("Enter a San Francisco zip code above to get started.")
+    st.stop()
 
-# ---------- neighborhood dropdown ----------
-nb_rows, _, nb_ms = q("""
-    SELECT DISTINCT neighborhoods_analysis_boundaries
+if not (zip_code.isdigit() and len(zip_code) == 5):
+    st.warning("That doesn't look like a zip code. Try one like 94115.")
+    st.stop()
+
+hood_rows, _, hood_ms = q("""
+    SELECT neighborhoods_analysis_boundaries AS hood, count() AS n
     FROM sf_business
-    WHERE neighborhoods_analysis_boundaries != ''
-    ORDER BY 1
+    WHERE business_zip = {zip:String} AND hood != '' AND hood != 'Multiple'
+    GROUP BY hood
+    ORDER BY n DESC
+    LIMIT 1
+""", {"zip": zip_code})
+timings.append(("looking up your area", hood_ms))
+
+if not hood_rows:
+    st.warning("We couldn't find that zip code. Try one like 94115.")
+    st.stop()
+
+neighborhood = hood_rows[0][0]
+
+st.header(f"You're in {neighborhood}.")
+
+count_rows, _, count_ms = q(f"""
+    SELECT count() FROM sf_business
+    WHERE neighborhoods_analysis_boundaries = {{nb:String}}
+      AND location_end_date = ''
+      AND ({naics_filter_sql()})
+""", {"nb": neighborhood})
+timings.append(("counting places near you", count_ms))
+place_count = count_rows[0][0]
+
+all_rows, _, all_ms = q(f"""
+    SELECT neighborhoods_analysis_boundaries AS hood,
+           countIf(location_end_date = '' AND ({naics_filter_sql()})) AS n
+    FROM sf_business
+    WHERE hood != '' AND hood != 'Multiple'
+    GROUP BY hood
+    ORDER BY n DESC
 """)
-neighborhoods = [r[0] for r in nb_rows]
-st.caption(f"loaded {len(neighborhoods)} neighborhoods in {nb_ms} ms")
+timings.append(("comparing to the rest of the city", all_ms))
+all_df = pd.DataFrame(all_rows, columns=["hood", "n"]).reset_index(drop=True)
+all_df["rank"] = range(1, len(all_df) + 1)
+this_row = all_df[all_df["hood"] == neighborhood]
 
-neighborhood = st.selectbox("Pick a neighborhood", neighborhoods)
+st.markdown(f"## {place_count} places to gather within your zip code")
 
-save_col1, save_col2 = st.columns([3, 1])
-note = save_col1.text_input("One-line note (optional)", key="note_input", label_visibility="collapsed",
-                             placeholder="One-line note about this neighborhood (optional)")
-if save_col2.button(f"Save '{neighborhood}'"):
-    with pg().cursor() as c:
-        c.execute("INSERT INTO saved_neighborhoods (hood, note) VALUES (%s, %s)", (neighborhood, note))
-    st.rerun()
+if not this_row.empty and len(all_df) >= 3:
+    rank = int(this_row.iloc[0]["rank"])
+    pct = rank / len(all_df)
+    if pct <= 1 / 3:
+        phrase, third = "more than most of", "top"
+    elif pct <= 2 / 3:
+        phrase, third = "about the same as", "middle"
+    else:
+        phrase, third = "fewer than most of", "bottom"
+    st.write(f"That's {phrase} San Francisco — you're in the {third} third.")
 
 st.divider()
 
-# ---------- section 1: compare this neighborhood against all others ----------
-st.header("1. Compare neighborhoods")
-
-agg_rows, _, agg_ms = q("""
-    SELECT neighborhoods_analysis_boundaries,
-           countIf(location_end_date = '') AS open_now,
-           countIf(location_start_date != ''
-                   AND parseDateTimeBestEffortOrNull(location_start_date) >= toDate('2019-01-01')) AS opened_since_2019,
-           countIf(location_end_date != ''
-                   AND parseDateTimeBestEffortOrNull(location_end_date) >= toDate('2019-01-01')) AS closed_since_2019,
-           count() AS total
-    FROM sf_business
-    WHERE neighborhoods_analysis_boundaries != ''
-    GROUP BY neighborhoods_analysis_boundaries
-    HAVING total >= 20
-""")
-agg_df = pd.DataFrame(agg_rows, columns=["neighborhood", "open_now", "opened_since_2019", "closed_since_2019", "total"])
-agg_df["net_change"] = agg_df["opened_since_2019"] - agg_df["closed_since_2019"]
-agg_df = agg_df.sort_values("net_change", ascending=False).reset_index(drop=True)
-agg_df["rank"] = agg_df.index + 1
-this_row = agg_df[agg_df["neighborhood"] == neighborhood]
-
-c1, c2, c3, c4 = st.columns(4)
-if not this_row.empty:
-    row = this_row.iloc[0]
-    c1.metric("Open now", f"{int(row['open_now']):,}", help=f"{agg_ms} ms")
-    c2.metric("Opened since 2019", f"{int(row['opened_since_2019']):,}")
-    c3.metric("Closed since 2019", f"{int(row['closed_since_2019']):,}")
-    net = int(row["net_change"])
-    c4.metric(
-        "Net change since 2019",
-        f"{net:+,}",
-        help=f"Ranked #{int(row['rank'])} of {len(agg_df)} neighborhoods by net change (opened minus closed since 2019)",
-    )
-else:
-    st.info("Not enough data to compare this neighborhood.")
-
-st.subheader("Closures per year")
-st.caption("Raw count of closures by year — reflects reporting patterns as well as actual closures, not a trend claim.")
+st.subheader(f"Businesses closing each year in {neighborhood}")
 year_rows, _, year_ms = q("""
     SELECT toYear(parseDateTimeBestEffortOrNull(location_end_date)) AS yr, count() AS n
     FROM sf_business
@@ -148,46 +136,47 @@ year_rows, _, year_ms = q("""
     GROUP BY yr
     ORDER BY yr
 """, {"nb": neighborhood})
-year_df = pd.DataFrame(year_rows, columns=["year", "closures"]).set_index("year")
+timings.append(("building the chart", year_ms))
+year_df = pd.DataFrame(year_rows, columns=["Year", "Businesses closed"]).set_index("Year")
 year_df = year_df.reindex(range(2015, 2027), fill_value=0)
-st.caption(f"closures per year query: {year_ms} ms")
 st.bar_chart(year_df)
 
 st.divider()
 
-# ---------- section 2: still-open gathering places ----------
-st.header("2. Still-open gathering places")
-st.caption(f"Filtered to {GATHERING_LABEL} via self-reported NAICS code.")
+st.subheader("Places near you")
+st.caption("Restaurants, bars, cafés, gyms, and bookstores that are still open.")
 
 places_rows, _, places_ms = q(f"""
-    SELECT uniqueid, dba_name, full_business_address, self_reported_naics_code
+    SELECT uniqueid, dba_name, full_business_address
     FROM sf_business
     WHERE neighborhoods_analysis_boundaries = {{nb:String}}
       AND location_end_date = ''
       AND ({naics_filter_sql()})
     ORDER BY dba_name
 """, {"nb": neighborhood})
-st.caption(f"found {len(places_rows)} places in {places_ms} ms")
+timings.append(("finding places near you", places_ms))
 
-places_df = pd.DataFrame(places_rows, columns=["id", "name", "address", "naics"])
-st.dataframe(places_df[["name", "address"]], width="stretch", hide_index=True)
+if places_rows:
+    for _, name, address in places_rows:
+        st.markdown(f"- **{name}** — {address}")
+else:
+    st.write("We couldn't find any open places to gather in this area yet.")
 
 st.divider()
 
-# ---------- section 3: invite a friend ----------
-st.header("3. Invite a friend")
+st.subheader("Invite a friend")
 
 if places_rows:
     place_labels = [f"{r[1]} — {r[2]}" for r in places_rows]
     place_idx = st.selectbox("Pick a place", range(len(place_labels)), format_func=lambda i: place_labels[i])
-    chosen_id, chosen_name, chosen_addr, _ = places_rows[place_idx]
+    chosen_id, chosen_name, chosen_addr = places_rows[place_idx]
     evening = st.date_input("Pick an evening")
 
     if "draft" not in st.session_state:
         st.session_state.draft = ""
 
-    if st.button("Draft invite with Gemini"):
-        api_key = os.getenv("GEMINI_API_KEY")
+    if st.button("Write an invite for me"):
+        api_key = secret("GEMINI_API_KEY")
         prompt = (
             f"Write a short, casual, low-pressure text message (2-3 sentences max) inviting a friend "
             f"to hang out at '{chosen_name}' ({chosen_addr}) in San Francisco on {evening.strftime('%A, %B %d')}. "
@@ -210,14 +199,14 @@ if places_rows:
             data = resp.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             st.session_state.draft = text
-            st.caption(f"Gemini responded in {gemini_ms} ms")
-        except Exception as e:
-            st.error(f"Gemini request failed: {e}")
+            timings.append(("writing your invite", gemini_ms))
+        except Exception:
+            st.error("Something went wrong writing your invite. Please try again.")
 
     if st.session_state.draft:
-        st.text_area("Draft invite", st.session_state.draft, height=100)
+        st.write(st.session_state.draft)
 
-    if st.button("RSVP: I'm going"):
+    if st.button("I'm going"):
         night_str = evening.isoformat()
         with pg().cursor() as c:
             c.execute(
@@ -229,7 +218,9 @@ if places_rows:
                 (chosen_id, night_str),
             )
             same_count = c.fetchone()[0]
-        st.success(f"You're in! {same_count} {'person has' if same_count == 1 else 'people have'} picked "
+        st.success(f"You're going! {same_count} {'person has' if same_count == 1 else 'people have'} also picked "
                    f"{chosen_name} on {evening.strftime('%A, %B %d')}.")
 else:
-    st.info("No open gathering places found in this neighborhood.")
+    st.info("No open places to gather here yet, so there's nothing to invite a friend to.")
+
+st.caption(" · ".join(f"{label}: {ms} ms" for label, ms in timings))
