@@ -267,9 +267,37 @@ def geocode(query):
         return None
 
 
-def short_display(display_name):
-    parts = [p.strip() for p in display_name.split(",")]
-    return ", ".join(parts[:4]) if len(parts) > 4 else display_name
+STREET_ABBREV = {
+    "Street": "St", "Avenue": "Ave", "Boulevard": "Blvd", "Drive": "Dr",
+    "Road": "Rd", "Lane": "Ln", "Court": "Ct", "Place": "Pl", "Terrace": "Ter",
+    "Highway": "Hwy", "Parkway": "Pkwy", "Circle": "Cir",
+}
+DROP_ADDRESS_SUFFIXES = ("united states", "usa", "us", "california", "ca")
+
+
+def format_clean_address(raw_str):
+    """Cleans raw geocoder output: drops county/country/state noise, abbreviates
+    street suffixes, and joins a leading house number with its street name."""
+    if not raw_str:
+        return raw_str
+    parts = [p.strip() for p in raw_str.split(",") if p.strip()]
+    cleaned = []
+    for p in parts:
+        low = p.lower()
+        if low in DROP_ADDRESS_SUFFIXES:
+            continue
+        if "county" in low:
+            continue
+        cleaned.append(p)
+    if not cleaned:
+        cleaned = parts
+    for i, p in enumerate(cleaned):
+        words = [STREET_ABBREV.get(w, w) for w in p.split()]
+        cleaned[i] = " ".join(words)
+    is_house_number = cleaned[0].replace("-", "").isdigit() and not (len(cleaned[0]) == 5 and cleaned[0].isdigit())
+    if len(cleaned) >= 2 and is_house_number:
+        cleaned = [f"{cleaned[0]} {cleaned[1]}"] + cleaned[2:]
+    return ", ".join(cleaned)
 
 
 def match_neighborhood_name(text):
@@ -453,7 +481,7 @@ OUT_OF_SF_MILES = 1.0
 
 def render_body(neighborhood=None, anchor=None):
     if anchor:
-        st.markdown(f"<div class='muted-text' style='margin-bottom:12px;'>Found: {anchor['label']}.</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='muted-text' style='margin-bottom:12px;'>Found: {format_clean_address(anchor['label'])}.</div>", unsafe_allow_html=True)
         raw_rows, fetch_ms = places_near_anchor(anchor["lat"], anchor["lon"])
         rows = [
             {"id": r[0], "name": r[1], "addr": r[2], "naics": r[3], "start": r[4], "dist_m": r[5], "hood": r[6]}
@@ -590,7 +618,7 @@ def render_body(neighborhood=None, anchor=None):
             render_generated_text(st.session_state.solo_draft)
 
         if st.button(
-            "Invite someone", key="invite_button",
+            "Invite someone", type="primary", key="invite_button",
             disabled=st.session_state.writing_invite,
         ):
             st.session_state.writing_invite = True
@@ -923,6 +951,17 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
 [data-testid="stSelectbox"] div[data-baseweb="select"] > div:focus-within {
     border-color: #3B82F6 !important;
 }
+
+/* address suggestions: visually attached to the search box above it */
+.st-key-address_suggestion {
+    margin-top: -8px !important;
+}
+.st-key-address_suggestion div[data-baseweb="select"] > div {
+    border-top-left-radius: 0 !important;
+    border-top-right-radius: 0 !important;
+    border-top: none !important;
+    background-color: rgba(59,130,246,0.06) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -994,7 +1033,7 @@ elif cur_search != st.session_state.prev_search and cur_search:
             result = geocode(f"{cleaned}, CA, USA")
             if result:
                 lat, lon, display = result
-                st.session_state.anchor = {"lat": lat, "lon": lon, "label": short_display(display)}
+                st.session_state.anchor = {"lat": lat, "lon": lon, "label": format_clean_address(display)}
                 st.session_state.neighborhood = None
                 st.session_state.neighborhood_pills = None
                 st.session_state.neighborhood_dropdown = None
@@ -1023,7 +1062,7 @@ elif cur_search != st.session_state.prev_search and cur_search:
                 result = geocode(cleaned)
                 if result:
                     lat, lon, display = result
-                    st.session_state.anchor = {"lat": lat, "lon": lon, "label": short_display(display)}
+                    st.session_state.anchor = {"lat": lat, "lon": lon, "label": format_clean_address(display)}
                     st.session_state.neighborhood = None
                     st.session_state.neighborhood_pills = None
                     st.session_state.neighborhood_dropdown = None
