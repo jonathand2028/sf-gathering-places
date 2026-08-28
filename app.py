@@ -325,27 +325,6 @@ def match_neighborhood_name(text):
     return None
 
 
-@st.cache_data(ttl=300)
-def fetch_address_suggestions(query):
-    sql = """
-        SELECT full_business_address,
-               any(readWKTPoint(location).1) AS lon,
-               any(readWKTPoint(location).2) AS lat
-        FROM sf_business
-        WHERE full_business_address ILIKE {pattern:String}
-          AND city = 'San Francisco'
-          AND location != '' AND startsWith(location, 'POINT')
-        GROUP BY full_business_address
-        LIMIT 5
-    """
-    try:
-        r = ch().query(sql, parameters={"pattern": f"%{query}%"})
-    except Exception as e:
-        record_error(sql, e)
-        return []
-    return [(row[0], row[2], row[1]) for row in r.result_rows]
-
-
 def format_distance(dist_m):
     miles = dist_m / 1609.34
     if miles <= 2:
@@ -616,7 +595,7 @@ def render_body(neighborhood=None, anchor=None):
                 st.toast("Saved")
             except Exception:
                 st.warning("Couldn't save that just now. Please try again.")
-        if col2.button("Not for me", key="not_for_me"):
+        if col2.button("Not for me", type="primary", key="not_for_me"):
             try:
                 pg_exec(
                     "INSERT INTO dismissed_places (place_name, visitor_id) VALUES (%s, %s)",
@@ -999,54 +978,30 @@ div.stButton > button,
     box-shadow: 0 0 24px rgba(59,130,246,0.45) !important;
 }
 
-/* all venue-card buttons share identical box dimensions; only color/border differ */
-div.stButton > button[kind="primary"],
-div.stButton > button[kind="secondary"] {
-    padding: 12px 26px;
-    font-size: 15px;
-    border-radius: 10px;
-    font-weight: 600;
-    border-width: 1px;
-    border-style: solid;
+/* every button forced to identical primary blue -- no visual distinction by kind */
+div.stButton > button {
+    background: #3B82F6 !important;
+    color: #FFFFFF !important;
+    border: 1px solid #60A5FA !important;
+    border-radius: 8px !important;
+    padding: 8px 16px !important;
+    font-weight: 600 !important;
 }
-
-/* primary buttons: Save this, What's it like to go alone?, Invite someone */
-div.stButton > button[kind="primary"] {
-    background-color: #3B82F6;
-    color: #FFFFFF;
-    border: 1px solid #60A5FA;
-}
-div.stButton > button[kind="primary"]:hover {
-    background-color: #2563EB;
-    color: #FFFFFF;
-    border-color: #60A5FA;
+div.stButton > button:hover {
+    background: #2563EB !important;
+    color: #FFFFFF !important;
+    border-color: #60A5FA !important;
     box-shadow: 0 0 28px rgba(59,130,246,0.5);
     transform: translateY(-1px);
 }
-div.stButton > button[kind="primary"]:active {
+div.stButton > button:active {
     transform: scale(0.985);
 }
-div.stButton > button[kind="primary"]:disabled {
+div.stButton > button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
     transform: none;
     box-shadow: none;
-}
-
-/* secondary button: Not for me -- dark-glass, same footprint as the primaries, blue hover */
-div.stButton > button[kind="secondary"] {
-    background: rgba(255,255,255,0.08);
-    border: 1px solid rgba(255,255,255,0.25);
-    color: #CBD5E1;
-}
-div.stButton > button[kind="secondary"]:hover {
-    background: rgba(59,130,246,0.12);
-    border-color: #60A5FA;
-    color: #F1F5F9;
-    transform: translateY(-1px);
-}
-div.stButton > button[kind="secondary"]:active {
-    transform: scale(0.985);
 }
 
 /* keyboard focus ring, everything clickable */
@@ -1107,13 +1062,11 @@ if "prev_pills" not in st.session_state:
 if "prev_dropdown" not in st.session_state:
     st.session_state.prev_dropdown = None
 if "prev_search" not in st.session_state:
-    st.session_state.prev_search = None
-if "pending_suggestions" not in st.session_state:
-    st.session_state.pending_suggestions = []
+    st.session_state.prev_search = ""
 
 cur_pills = st.session_state.get("neighborhood_pills")
 cur_dropdown = st.session_state.get("neighborhood_dropdown")
-cur_search = st.session_state.get("search_box")
+cur_search = st.session_state.get("search_box", "")
 
 search_warning = None
 
@@ -1121,25 +1074,15 @@ if cur_pills != st.session_state.prev_pills and cur_pills is not None:
     st.session_state.neighborhood = cur_pills
     st.session_state.anchor = None
     st.session_state.neighborhood_dropdown = None
-    st.session_state.search_box = None
-    st.session_state.pending_suggestions = []
+    st.session_state.search_box = ""
 elif cur_dropdown != st.session_state.prev_dropdown and cur_dropdown is not None:
     st.session_state.neighborhood = cur_dropdown
     st.session_state.anchor = None
     st.session_state.neighborhood_pills = None
-    st.session_state.search_box = None
-    st.session_state.pending_suggestions = []
+    st.session_state.search_box = ""
 elif cur_search != st.session_state.prev_search and cur_search:
     cleaned = cur_search.strip()
-    picked = next((s for s in st.session_state.pending_suggestions if s[0] == cleaned), None)
-    st.session_state.pending_suggestions = []
-    if picked:
-        _addr, s_lat, s_lon = picked
-        st.session_state.anchor = {"lat": s_lat, "lon": s_lon, "label": cleaned}
-        st.session_state.neighborhood = None
-        st.session_state.neighborhood_pills = None
-        st.session_state.neighborhood_dropdown = None
-    elif cleaned.isdigit() and len(cleaned) == 5:
+    if cleaned.isdigit() and len(cleaned) == 5:
         if cleaned in SF_ZIP_COORDS:
             lon, lat = SF_ZIP_COORDS[cleaned]
             st.session_state.anchor = {"lat": lat, "lon": lon, "label": f"{cleaned}, San Francisco, CA"}
@@ -1172,19 +1115,15 @@ elif cur_search != st.session_state.prev_search and cur_search:
             else:
                 search_warning = "We're having trouble reaching our data right now. Please try again in a moment."
         else:
-            suggestions = fetch_address_suggestions(cleaned) if len(cleaned) >= 3 else []
-            if suggestions:
-                st.session_state.pending_suggestions = suggestions
+            result = geocode(cleaned)
+            if result:
+                lat, lon, display = result
+                st.session_state.anchor = {"lat": lat, "lon": lon, "label": clean_address_display(display)}
+                st.session_state.neighborhood = None
+                st.session_state.neighborhood_pills = None
+                st.session_state.neighborhood_dropdown = None
             else:
-                result = geocode(cleaned)
-                if result:
-                    lat, lon, display = result
-                    st.session_state.anchor = {"lat": lat, "lon": lon, "label": clean_address_display(display)}
-                    st.session_state.neighborhood = None
-                    st.session_state.neighborhood_pills = None
-                    st.session_state.neighborhood_dropdown = None
-                else:
-                    search_warning = "We couldn't find that address. Try a zip code or pick a neighborhood above."
+                search_warning = "We couldn't find that address. Try a zip code or pick a neighborhood above."
 
 st.session_state.prev_pills = cur_pills
 st.session_state.prev_dropdown = cur_dropdown
@@ -1210,15 +1149,11 @@ st.selectbox(
     label_visibility="collapsed",
 )
 
-suggestion_labels = [addr for addr, _lat, _lon in st.session_state.pending_suggestions]
-st.selectbox(
-    "Type SF address, neighborhood, or ZIP",
-    options=suggestion_labels,
-    index=None,
-    placeholder="Type SF address, neighborhood, or ZIP...",
+st.text_input(
+    "Search SF or Bay Area address, ZIP, or neighborhood",
+    placeholder="Search SF or Bay Area address, ZIP (e.g. 94115), or neighborhood...",
     key="search_box",
     label_visibility="collapsed",
-    accept_new_options=True,
 )
 if search_warning:
     st.warning(search_warning)
