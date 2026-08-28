@@ -1,5 +1,5 @@
 import html
-import os, sys, time, traceback
+import os, sys, time, traceback, uuid
 import requests
 import streamlit as st
 import clickhouse_connect, certifi, psycopg2
@@ -113,16 +113,20 @@ def ensure_tables():
             place_name TEXT,
             address TEXT,
             neighborhood TEXT,
+            visitor_id TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMPTZ DEFAULT now()
         )
     """)
+    pg_exec("ALTER TABLE saved_places ADD COLUMN IF NOT EXISTS visitor_id TEXT NOT NULL DEFAULT ''")
     pg_exec("""
         CREATE TABLE IF NOT EXISTS dismissed_places (
             id SERIAL PRIMARY KEY,
             place_name TEXT,
+            visitor_id TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMPTZ DEFAULT now()
         )
     """)
+    pg_exec("ALTER TABLE dismissed_places ADD COLUMN IF NOT EXISTS visitor_id TEXT NOT NULL DEFAULT ''")
     pg_exec("""
         CREATE TABLE IF NOT EXISTS shown_places (
             id SERIAL PRIMARY KEY,
@@ -416,7 +420,10 @@ def top_chip_neighborhoods(n=8):
 
 def fetch_dismissed_names():
     try:
-        rows = pg_query("SELECT place_name FROM dismissed_places")
+        rows = pg_query(
+            "SELECT place_name FROM dismissed_places WHERE visitor_id = %s",
+            (st.session_state.visitor_id,),
+        )
     except Exception:
         return set()
     return {row[0] for row in rows}
@@ -424,7 +431,10 @@ def fetch_dismissed_names():
 
 def fetch_saved_places():
     try:
-        return pg_query("SELECT id, place_name, address, neighborhood FROM saved_places ORDER BY created_at DESC")
+        return pg_query(
+            "SELECT id, place_name, address, neighborhood FROM saved_places WHERE visitor_id = %s ORDER BY created_at DESC",
+            (st.session_state.visitor_id,),
+        )
     except Exception:
         return []
 
@@ -554,15 +564,18 @@ def render_body(neighborhood=None, anchor=None):
         if col1.button("Save this", type="primary", key="save_this"):
             try:
                 pg_exec(
-                    "INSERT INTO saved_places (place_name, address, neighborhood) VALUES (%s, %s, %s)",
-                    (hero_name, hero_addr, hero_hood),
+                    "INSERT INTO saved_places (place_name, address, neighborhood, visitor_id) VALUES (%s, %s, %s, %s)",
+                    (hero_name, hero_addr, hero_hood, st.session_state.visitor_id),
                 )
                 st.toast("Saved")
             except Exception:
                 st.warning("Couldn't save that just now. Please try again.")
         if col2.button("Not for me", key="not_for_me"):
             try:
-                pg_exec("INSERT INTO dismissed_places (place_name) VALUES (%s)", (hero_name,))
+                pg_exec(
+                    "INSERT INTO dismissed_places (place_name, visitor_id) VALUES (%s, %s)",
+                    (hero_name, st.session_state.visitor_id),
+                )
             except Exception:
                 st.warning("Couldn't update that just now. Please try again.")
             st.session_state.solo_draft = ""
@@ -653,7 +666,10 @@ def render_body(neighborhood=None, anchor=None):
                 col1.markdown(f"**{place_name}** — {address} ({saved_hood})")
                 if col2.button("Remove", key=f"remove_{saved_id}"):
                     try:
-                        pg_exec("DELETE FROM saved_places WHERE id = %s", (saved_id,))
+                        pg_exec(
+                            "DELETE FROM saved_places WHERE id = %s AND visitor_id = %s",
+                            (saved_id, st.session_state.visitor_id),
+                        )
                     except Exception:
                         st.warning("Couldn't remove that just now. Please try again.")
                     st.rerun()
@@ -674,6 +690,9 @@ def render_body(neighborhood=None, anchor=None):
             unsafe_allow_html=True,
         )
 
+
+if "visitor_id" not in st.session_state:
+    st.session_state.visitor_id = str(uuid.uuid4())
 
 try:
     ensure_tables()
