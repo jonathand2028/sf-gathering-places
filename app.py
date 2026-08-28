@@ -948,7 +948,7 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
 
 /* ============ unified control system ============ */
 /* base rule: everything clickable */
-.stButton>button,
+div.stButton > button,
 .st-key-neighborhood_pills button,
 .st-key-category_filter button {
     cursor: pointer;
@@ -1000,8 +1000,8 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
 }
 
 /* all venue-card buttons share identical box dimensions; only color/border differ */
-.stButton>button[kind="primary"],
-.stButton>button[kind="secondary"] {
+div.stButton > button[kind="primary"],
+div.stButton > button[kind="secondary"] {
     padding: 12px 26px;
     font-size: 15px;
     border-radius: 10px;
@@ -1011,45 +1011,46 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
 }
 
 /* primary buttons: Save this, What's it like to go alone?, Invite someone */
-.stButton>button[kind="primary"] {
+div.stButton > button[kind="primary"] {
     background-color: #3B82F6;
     color: #FFFFFF;
-    border-color: transparent;
+    border: 1px solid #60A5FA;
 }
-.stButton>button[kind="primary"]:hover {
+div.stButton > button[kind="primary"]:hover {
     background-color: #2563EB;
     color: #FFFFFF;
+    border-color: #60A5FA;
     box-shadow: 0 0 28px rgba(59,130,246,0.5);
     transform: translateY(-1px);
 }
-.stButton>button[kind="primary"]:active {
+div.stButton > button[kind="primary"]:active {
     transform: scale(0.985);
 }
-.stButton>button[kind="primary"]:disabled {
+div.stButton > button[kind="primary"]:disabled {
     opacity: 0.5;
     cursor: not-allowed;
     transform: none;
     box-shadow: none;
 }
 
-/* secondary button: Not for me -- dark-glass, same footprint as the primaries */
-.stButton>button[kind="secondary"] {
-    background: rgba(255,255,255,0.05);
-    border-color: rgba(255,255,255,0.14);
+/* secondary button: Not for me -- dark-glass, same footprint as the primaries, blue hover */
+div.stButton > button[kind="secondary"] {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.25);
     color: #CBD5E1;
 }
-.stButton>button[kind="secondary"]:hover {
-    background: rgba(255,255,255,0.10);
-    border-color: rgba(255,255,255,0.28);
+div.stButton > button[kind="secondary"]:hover {
+    background: rgba(59,130,246,0.12);
+    border-color: #60A5FA;
     color: #F1F5F9;
     transform: translateY(-1px);
 }
-.stButton>button[kind="secondary"]:active {
+div.stButton > button[kind="secondary"]:active {
     transform: scale(0.985);
 }
 
 /* keyboard focus ring, everything clickable */
-.stButton>button:focus-visible,
+div.stButton > button:focus-visible,
 .st-key-neighborhood_pills button:focus-visible,
 .st-key-category_filter button:focus-visible,
 [data-testid="stTextInput"] input:focus-visible,
@@ -1083,16 +1084,6 @@ h1, h2, h3, h4, p, label, span, div { color: #F1F5F9; }
     border-color: #3B82F6 !important;
 }
 
-/* address suggestions: visually attached to the search box above it */
-.st-key-address_suggestion {
-    margin-top: -8px !important;
-}
-.st-key-address_suggestion div[data-baseweb="select"] > div {
-    border-top-left-radius: 0 !important;
-    border-top-right-radius: 0 !important;
-    border-top: none !important;
-    background-color: rgba(59,130,246,0.06) !important;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1116,16 +1107,13 @@ if "prev_pills" not in st.session_state:
 if "prev_dropdown" not in st.session_state:
     st.session_state.prev_dropdown = None
 if "prev_search" not in st.session_state:
-    st.session_state.prev_search = ""
-if "prev_suggestion" not in st.session_state:
-    st.session_state.prev_suggestion = None
+    st.session_state.prev_search = None
 if "pending_suggestions" not in st.session_state:
     st.session_state.pending_suggestions = []
 
 cur_pills = st.session_state.get("neighborhood_pills")
 cur_dropdown = st.session_state.get("neighborhood_dropdown")
-cur_search = st.session_state.get("search_box", "")
-cur_suggestion = st.session_state.get("address_suggestion")
+cur_search = st.session_state.get("search_box")
 
 search_warning = None
 
@@ -1133,27 +1121,25 @@ if cur_pills != st.session_state.prev_pills and cur_pills is not None:
     st.session_state.neighborhood = cur_pills
     st.session_state.anchor = None
     st.session_state.neighborhood_dropdown = None
-    st.session_state.search_box = ""
-    st.session_state.pending_suggestions = []
-elif cur_suggestion != st.session_state.prev_suggestion and cur_suggestion is not None:
-    match = next((s for s in st.session_state.pending_suggestions if s[0] == cur_suggestion), None)
-    if match:
-        _addr, s_lat, s_lon = match
-        st.session_state.anchor = {"lat": s_lat, "lon": s_lon, "label": cur_suggestion}
-        st.session_state.neighborhood = None
-        st.session_state.neighborhood_pills = None
-        st.session_state.neighborhood_dropdown = None
+    st.session_state.search_box = None
     st.session_state.pending_suggestions = []
 elif cur_dropdown != st.session_state.prev_dropdown and cur_dropdown is not None:
     st.session_state.neighborhood = cur_dropdown
     st.session_state.anchor = None
     st.session_state.neighborhood_pills = None
-    st.session_state.search_box = ""
+    st.session_state.search_box = None
     st.session_state.pending_suggestions = []
 elif cur_search != st.session_state.prev_search and cur_search:
-    st.session_state.pending_suggestions = []
     cleaned = cur_search.strip()
-    if cleaned.isdigit() and len(cleaned) == 5:
+    picked = next((s for s in st.session_state.pending_suggestions if s[0] == cleaned), None)
+    st.session_state.pending_suggestions = []
+    if picked:
+        _addr, s_lat, s_lon = picked
+        st.session_state.anchor = {"lat": s_lat, "lon": s_lon, "label": cleaned}
+        st.session_state.neighborhood = None
+        st.session_state.neighborhood_pills = None
+        st.session_state.neighborhood_dropdown = None
+    elif cleaned.isdigit() and len(cleaned) == 5:
         if cleaned in SF_ZIP_COORDS:
             lon, lat = SF_ZIP_COORDS[cleaned]
             st.session_state.anchor = {"lat": lat, "lon": lon, "label": f"{cleaned}, San Francisco, CA"}
@@ -1203,7 +1189,6 @@ elif cur_search != st.session_state.prev_search and cur_search:
 st.session_state.prev_pills = cur_pills
 st.session_state.prev_dropdown = cur_dropdown
 st.session_state.prev_search = cur_search
-st.session_state.prev_suggestion = cur_suggestion
 
 if chip_hoods:
     st.markdown("<div class='chip-caption'>The neighborhoods with the most places to gather</div>", unsafe_allow_html=True)
@@ -1225,20 +1210,18 @@ st.selectbox(
     label_visibility="collapsed",
 )
 
-st.text_input(
-    "Your address, neighborhood, or zip", placeholder="Your address, neighborhood, or zip",
-    key="search_box", label_visibility="collapsed",
+suggestion_labels = [addr for addr, _lat, _lon in st.session_state.pending_suggestions]
+st.selectbox(
+    "Type SF address, neighborhood, or ZIP",
+    options=suggestion_labels,
+    index=None,
+    placeholder="Type SF address, neighborhood, or ZIP...",
+    key="search_box",
+    label_visibility="collapsed",
+    accept_new_options=True,
 )
 if search_warning:
     st.warning(search_warning)
-
-if st.session_state.pending_suggestions:
-    suggestion_labels = [addr for addr, _lat, _lon in st.session_state.pending_suggestions]
-    st.selectbox(
-        "Matching SF addresses", options=suggestion_labels, index=None,
-        placeholder="Matching SF addresses — pick one",
-        key="address_suggestion",
-    )
 
 neighborhood = st.session_state.neighborhood
 anchor = st.session_state.anchor
